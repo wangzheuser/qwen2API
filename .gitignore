@@ -43,5 +43,5 @@ fix_*.py
 
 # local cleanup
 tests/
-docs/superpowers/
+docs/
 *.tsbuildinfo
