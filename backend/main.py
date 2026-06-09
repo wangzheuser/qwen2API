@@ -22,6 +22,7 @@ from backend.services.qwen_client import QwenClient
 from backend.services.file_store import LocalFileStore
 from backend.services.context_offload import ContextOffloader
 from backend.services.upstream_file_uploader import UpstreamFileUploader
+from backend.services.video_task_store import VideoTaskRunner, VideoTaskStore
 import backend.api.models as models
 from backend.api import admin, v1_chat, probes, anthropic, gemini, embeddings, images, videos, files_api, responses
 from backend.services.garbage_collector import garbage_collect_chats
@@ -63,6 +64,7 @@ async def lifespan(app: FastAPI):
         app.state.session_affinity_db = AsyncJsonDB(settings.CONTEXT_AFFINITY_FILE, default_data=[])
         app.state.context_cache_db = AsyncJsonDB(settings.CONTEXT_CACHE_FILE, default_data=[])
         app.state.uploaded_files_db = AsyncJsonDB(settings.UPLOADED_FILES_FILE, default_data=[])
+        app.state.video_tasks_db = AsyncJsonDB(settings.VIDEO_TASKS_FILE, default_data=[])
 
         # 初始化组件
         app.state.account_pool = AccountPool(app.state.accounts_db, max_inflight=settings.MAX_INFLIGHT_PER_ACCOUNT)
@@ -74,6 +76,12 @@ async def lifespan(app: FastAPI):
         app.state.context_offloader = ContextOffloader(settings)
         app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
         app.state.session_locks = SessionLockRegistry()
+        app.state.video_task_store = VideoTaskStore(app.state.video_tasks_db, ttl_seconds=settings.VIDEO_TASK_TTL_SECONDS)
+        app.state.video_task_runner = VideoTaskRunner(
+            app,
+            app.state.video_task_store,
+            concurrency=settings.VIDEO_TASK_WORKER_CONCURRENCY,
+        )
 
         # 加载账号并启动后台清理任务
         await app.state.account_pool.load()
@@ -81,8 +89,13 @@ async def lifespan(app: FastAPI):
         await app.state.config_db.load()
         await app.state.session_affinity.load()
         await app.state.upstream_file_cache.load()
+        await app.state.video_task_store.load()
+        interrupted_count = await app.state.video_task_store.mark_interrupted_pending()
+        if interrupted_count:
+            log.warning("已将 %s 个遗留视频任务标记为 interrupted", interrupted_count)
         asyncio.create_task(garbage_collect_chats(app))
         asyncio.create_task(context_cleanup_loop(app))
+        await app.state.video_task_runner.start()
 
         # 启动 chat_id 预热池（省上游 /chats/new 握手 500ms~6s）
         from backend.services.chat_id_pool import ChatIdPool
@@ -110,6 +123,9 @@ async def lifespan(app: FastAPI):
         keepalive_service = getattr(app.state, "keepalive_service", None)
         if keepalive_service:
             await keepalive_service.stop()
+        video_task_runner = getattr(app.state, "video_task_runner", None)
+        if video_task_runner:
+            await video_task_runner.stop()
         # 关闭 HTTP 连接池
         await app.state.qwen_client._http_client.aclose()
         log.info("HTTP 连接池已关闭")

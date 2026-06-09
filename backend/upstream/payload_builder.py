@@ -21,9 +21,10 @@ CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
 }
 
 IMAGE_CHAT_TYPES = {"image_gen", "t2i"}
-VIDEO_CHAT_TYPES = {"t2v"}
+VIDEO_CHAT_TYPES = {"t2v", "i2v"}
 UPSTREAM_IMAGE_CHAT_TYPE = "t2i"
 UPSTREAM_VIDEO_CHAT_TYPE = "t2v"
+UPSTREAM_IMAGE_TO_VIDEO_CHAT_TYPE = "i2v"
 
 
 def _apply_thinking_config(feature_config: dict, enabled: bool) -> None:
@@ -77,6 +78,18 @@ def _build_video_feature_config(video_options: dict) -> dict:
     }
 
 
+def _build_i2v_feature_config(video_options: dict) -> dict:
+    """按 Qwen Web 抓包结构构造图生视频功能配置。"""
+    return {
+        "thinking_enabled": False,
+        "output_schema": "phase",
+        "research_mode": "normal",
+        "auto_thinking": False,
+        "thinking_mode": "Fast",
+        "auto_search": True,
+    }
+
+
 def build_chat_payload(
     chat_id: str,
     model: str,
@@ -91,6 +104,7 @@ def build_chat_payload(
     ts = int(time.time())
     is_image_gen = chat_type in IMAGE_CHAT_TYPES
     is_video_gen = chat_type in VIDEO_CHAT_TYPES
+    is_i2v_gen = chat_type == UPSTREAM_IMAGE_TO_VIDEO_CHAT_TYPE
     image_options = image_options or {}
     if is_image_gen:
         feature_config = _build_image_feature_config(image_options)
@@ -103,15 +117,24 @@ def build_chat_payload(
             "size": _image_ratio(image_options),
         }
     elif is_video_gen:
-        feature_config = _build_video_feature_config(image_options)
-        message_chat_type = UPSTREAM_VIDEO_CHAT_TYPE
-        sub_chat_type = UPSTREAM_VIDEO_CHAT_TYPE
-        message_extra_meta = {
-            "subChatType": UPSTREAM_VIDEO_CHAT_TYPE,
-            "mode": "video_generation",
-            "aspectRatio": _image_ratio(image_options),
-            "size": _image_ratio(image_options),
-        }
+        if is_i2v_gen:
+            feature_config = _build_i2v_feature_config(image_options)
+            message_chat_type = UPSTREAM_IMAGE_TO_VIDEO_CHAT_TYPE
+            sub_chat_type = UPSTREAM_IMAGE_TO_VIDEO_CHAT_TYPE
+            message_extra_meta = {
+                "subChatType": UPSTREAM_IMAGE_TO_VIDEO_CHAT_TYPE,
+                "size": _image_ratio(image_options),
+            }
+        else:
+            feature_config = _build_video_feature_config(image_options)
+            message_chat_type = UPSTREAM_VIDEO_CHAT_TYPE
+            sub_chat_type = UPSTREAM_VIDEO_CHAT_TYPE
+            message_extra_meta = {
+                "subChatType": UPSTREAM_VIDEO_CHAT_TYPE,
+                "mode": "video_generation",
+                "aspectRatio": _image_ratio(image_options),
+                "size": _image_ratio(image_options),
+            }
     else:
         feature_config = {
             **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,

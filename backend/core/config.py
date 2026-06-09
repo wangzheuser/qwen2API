@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     CONTEXT_ALLOWED_GENERATED_EXTS: str = os.getenv("CONTEXT_ALLOWED_GENERATED_EXTS", "txt,md,json,log")
     CONTEXT_ALLOWED_USER_EXTS: str = os.getenv("CONTEXT_ALLOWED_USER_EXTS", "txt,md,json,log,xml,yaml,yml,csv,html,css,py,js,ts,java,c,cpp,cs,php,go,rb,sh,zsh,ps1,bat,cmd,pdf,doc,docx,ppt,pptx,xls,xlsx,png,jpg,jpeg,webp,gif,tiff,bmp,svg")
 
+    # 视频异步任务配置：显式 async=true 时使用，默认不改变同步视频接口行为。
+    VIDEO_TASKS_FILE: str = os.getenv("VIDEO_TASKS_FILE", str(BASE_DIR / "backend" / "data" / "video_tasks.json"))
+    VIDEO_TASK_TTL_SECONDS: int = int(os.getenv("VIDEO_TASK_TTL_SECONDS", 86400))
+    VIDEO_TASK_WORKER_CONCURRENCY: int = int(os.getenv("VIDEO_TASK_WORKER_CONCURRENCY", 1))
+
     class Config:
         env_file = ".env"
         extra = "ignore"
