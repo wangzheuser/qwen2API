@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -17,6 +17,7 @@ log = logging.getLogger("qwen2api.upstream_proxy")
 
 _UUID_TOKEN = "{uuid}"
 _GLOBAL_BINDING_KEY = "__global__"
+_QWEN_PROXY_TEST_URL = "https://chat.qwen.ai/api/v1/auths/"
 
 
 @dataclass
@@ -80,9 +81,7 @@ def resolve_proxy(account: Any | None = None, *, force_refresh: bool = False) ->
     if not is_template_proxy(proxy):
         return proxy
 
-    bind_per_account = bool(getattr(settings, "QWEN_PROXY_POOL_BIND_PER_ACCOUNT", True))
-    key = _binding_key(account) if bind_per_account else _GLOBAL_BINDING_KEY
-
+    key = _binding_key(account)
     with _lock:
         binding = _bindings.get(key)
         if binding is not None and not force_refresh:
@@ -112,9 +111,8 @@ def mark_proxy_failure(account: Any | None, proxy_url: str | None, exc: BaseExce
                 _bindings.pop(key, None)
 
     log.warning(
-        "[UpstreamProxy] proxy failure key=%s proxy=%s error=%s",
+        "[UpstreamProxy] proxy failure key=%s error=%s",
         key,
-        mask_proxy_url(proxy_url),
         exc,
     )
 
@@ -156,31 +154,6 @@ def is_proxy_network_error(exc: BaseException) -> bool:
     )
 
 
-def mask_proxy_url(proxy_url: str | None) -> str:
-    """脱敏展示代理 URL，避免泄露密码。"""
-    if not proxy_url:
-        return ""
-    try:
-        parts = urlsplit(proxy_url)
-        if not parts.username:
-            return proxy_url
-
-        username = unquote(parts.username)
-        masked_user = username[:2] + "***" if len(username) > 2 else "***"
-        host = parts.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = quote(masked_user, safe="*")
-        if parts.password is not None:
-            netloc += ":***"
-        netloc += f"@{host}"
-        if parts.port is not None:
-            netloc += f":{parts.port}"
-        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    except Exception:
-        return "***"
-
-
 def to_playwright_proxy(proxy_url: str | None) -> dict[str, str] | None:
     """转换为 Playwright/Camoufox launch proxy 参数。"""
     if not proxy_url:
@@ -204,6 +177,31 @@ def to_playwright_proxy(proxy_url: str | None) -> dict[str, str] | None:
     return result
 
 
+async def test_proxy_connectivity(proxy_template: str) -> tuple[bool, str]:
+    """测试候选代理能否访问 Qwen 官网。"""
+    candidate = (proxy_template or "").strip()
+    if not candidate:
+        return True, "代理为空，跳过测试"
+
+    proxy_url = _render_template(candidate) if is_template_proxy(candidate) else candidate
+    timeout = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://chat.qwen.ai/",
+        "Origin": "https://chat.qwen.ai",
+    }
+    try:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(_QWEN_PROXY_TEST_URL, headers=headers)
+        # 407 明确代表代理认证失败；Qwen 返回的 401/403/WAF 页面不代表代理不可用。
+        if resp.status_code == 407:
+            return False, "代理认证失败，HTTP 407"
+        return True, f"代理测试通过，HTTP {resp.status_code}"
+    except Exception as exc:
+        return False, f"代理测试失败：{type(exc).__name__}: {exc}"
+
+
 def proxy_status() -> dict[str, Any]:
     """返回管理端可展示的代理聚合状态。"""
     raw = _raw_proxy()
@@ -215,9 +213,6 @@ def proxy_status() -> dict[str, Any]:
         "enabled": is_proxy_enabled(),
         "configured": bool(raw),
         "template_mode": is_template_proxy(raw),
-        "bind_per_account": bool(getattr(settings, "QWEN_PROXY_POOL_BIND_PER_ACCOUNT", True)),
-        "failure_cooldown_seconds": int(getattr(settings, "QWEN_PROXY_FAILURE_COOLDOWN_SECONDS", 300) or 0),
-        "masked_proxy": mask_proxy_url(raw),
         "bound_accounts": bound_accounts,
         "failures_total": failures_total,
         "last_failure_at": last_failure_at,

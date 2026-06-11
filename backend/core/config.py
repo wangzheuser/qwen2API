@@ -58,8 +58,6 @@ class Settings(BaseSettings):
     # Qwen 上游代理：仅作用于 chat.qwen.ai 访问。
     QWEN_UPSTREAM_PROXY: str = os.getenv("QWEN_UPSTREAM_PROXY", "")
     QWEN_PROXY_ENABLED: bool = _env_bool("QWEN_PROXY_ENABLED", False)
-    QWEN_PROXY_POOL_BIND_PER_ACCOUNT: bool = _env_bool("QWEN_PROXY_POOL_BIND_PER_ACCOUNT", True)
-    QWEN_PROXY_FAILURE_COOLDOWN_SECONDS: int = int(os.getenv("QWEN_PROXY_FAILURE_COOLDOWN_SECONDS", 300))
 
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

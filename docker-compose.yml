@@ -29,8 +29,6 @@ services:
       CHAT_ID_PREWARM_LARGE_POOL_ENABLED: "false"
       QWEN_UPSTREAM_PROXY: ""
       QWEN_PROXY_ENABLED: "false"
-      QWEN_PROXY_POOL_BIND_PER_ACCOUNT: "true"
-      QWEN_PROXY_FAILURE_COOLDOWN_SECONDS: "300"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7860/healthz || exit 1"]
       interval: 30s

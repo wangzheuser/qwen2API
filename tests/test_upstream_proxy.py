@@ -4,6 +4,7 @@ import types
 import unittest
 
 import httpx
+from fastapi import HTTPException
 
 from backend.core.account_pool import Account, AccountPool
 from backend.core.config import settings
@@ -11,9 +12,9 @@ from backend.core.database import AsyncJsonDB
 from backend.core.upstream_proxy import (
     clear_proxy_bindings,
     mark_proxy_failure,
-    mask_proxy_url,
     proxy_status,
     resolve_proxy,
+    test_proxy_connectivity,
     to_playwright_proxy,
 )
 
@@ -23,8 +24,6 @@ class ProxySettingsMixin:
         self.old_values = {
             "QWEN_PROXY_ENABLED": settings.QWEN_PROXY_ENABLED,
             "QWEN_UPSTREAM_PROXY": settings.QWEN_UPSTREAM_PROXY,
-            "QWEN_PROXY_POOL_BIND_PER_ACCOUNT": settings.QWEN_PROXY_POOL_BIND_PER_ACCOUNT,
-            "QWEN_PROXY_FAILURE_COOLDOWN_SECONDS": settings.QWEN_PROXY_FAILURE_COOLDOWN_SECONDS,
         }
         clear_proxy_bindings()
 
@@ -35,17 +34,20 @@ class ProxySettingsMixin:
 
 
 class UpstreamProxyTests(ProxySettingsMixin, unittest.TestCase):
-    def test_static_proxy_and_mask(self):
+    def test_static_proxy_resolves_without_binding(self):
         settings.QWEN_PROXY_ENABLED = True
         settings.QWEN_UPSTREAM_PROXY = "http://user:secret@127.0.0.1:7890"
 
-        self.assertEqual(resolve_proxy(), "http://user:secret@127.0.0.1:7890")
-        self.assertEqual(mask_proxy_url(settings.QWEN_UPSTREAM_PROXY), "http://us***:***@127.0.0.1:7890")
+        acc_a = Account(email="a@example.com", token="tok-a")
+        acc_b = Account(email="b@example.com", token="tok-b")
+
+        self.assertEqual(resolve_proxy(acc_a), "http://user:secret@127.0.0.1:7890")
+        self.assertEqual(resolve_proxy(acc_b), "http://user:secret@127.0.0.1:7890")
+        self.assertEqual(proxy_status()["bound_accounts"], 0)
 
     def test_uuid_template_binds_per_account_and_refreshes(self):
         settings.QWEN_PROXY_ENABLED = True
         settings.QWEN_UPSTREAM_PROXY = "http://node.{uuid}:pass@127.0.0.1:9200"
-        settings.QWEN_PROXY_POOL_BIND_PER_ACCOUNT = True
 
         acc_a = Account(email="a@example.com", token="tok-a")
         acc_b = Account(email="b@example.com", token="tok-b")
@@ -57,6 +59,7 @@ class UpstreamProxyTests(ProxySettingsMixin, unittest.TestCase):
 
         second = resolve_proxy(acc_b)
         self.assertNotEqual(first, second)
+        self.assertEqual(proxy_status()["bound_accounts"], 2)
 
         refreshed = resolve_proxy(acc_a, force_refresh=True)
         self.assertNotEqual(first, refreshed)
@@ -74,11 +77,245 @@ class UpstreamProxyTests(ProxySettingsMixin, unittest.TestCase):
         self.assertNotEqual(old_proxy, new_proxy)
         self.assertEqual(proxy_status()["failures_total"], before + 1)
 
+    def test_proxy_status_drops_removed_fields(self):
+        status = proxy_status()
+
+        self.assertNotIn("masked_proxy", status)
+        self.assertNotIn("bind_per_account", status)
+        self.assertNotIn("failure_cooldown_seconds", status)
+
     def test_playwright_proxy_conversion(self):
         converted = to_playwright_proxy("http://node.abc:pass@127.0.0.1:9200")
         self.assertEqual(converted["server"], "http://127.0.0.1:9200")
         self.assertEqual(converted["username"], "node.abc")
         self.assertEqual(converted["password"], "pass")
+
+
+class ProxyConnectivityTests(ProxySettingsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_connectivity_accepts_any_non_proxy_auth_status(self):
+        from backend.core import upstream_proxy as proxy_module
+
+        class FakeResponse:
+            status_code = 403
+
+        class FakeAsyncClient:
+            created = []
+
+            def __init__(self, **kwargs):
+                self.proxy = kwargs.get("proxy")
+                type(self).created.append(self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc_info):
+                return False
+
+            async def get(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return FakeResponse()
+
+        old_async_client = proxy_module.httpx.AsyncClient
+        proxy_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            ok, message = await test_proxy_connectivity("http://127.0.0.1:7890")
+        finally:
+            proxy_module.httpx.AsyncClient = old_async_client
+
+        self.assertTrue(ok)
+        self.assertIn("HTTP 403", message)
+        self.assertEqual(FakeAsyncClient.created[0].proxy, "http://127.0.0.1:7890")
+
+    async def test_connectivity_renders_uuid_template_for_test(self):
+        from backend.core import upstream_proxy as proxy_module
+
+        class FakeResponse:
+            status_code = 200
+
+        class FakeAsyncClient:
+            created = []
+
+            def __init__(self, **kwargs):
+                self.proxy = kwargs.get("proxy")
+                type(self).created.append(self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc_info):
+                return False
+
+            async def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        old_async_client = proxy_module.httpx.AsyncClient
+        proxy_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            ok, _message = await test_proxy_connectivity("http://node.{uuid}:pass@127.0.0.1:9200")
+        finally:
+            proxy_module.httpx.AsyncClient = old_async_client
+
+        self.assertTrue(ok)
+        self.assertRegex(FakeAsyncClient.created[0].proxy, r"^http://node\.[0-9a-f]{32}:pass@127\.0\.0\.1:9200$")
+
+    async def test_connectivity_rejects_proxy_auth_status(self):
+        from backend.core import upstream_proxy as proxy_module
+
+        class FakeResponse:
+            status_code = 407
+
+        class FakeAsyncClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc_info):
+                return False
+
+            async def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        old_async_client = proxy_module.httpx.AsyncClient
+        proxy_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            ok, message = await test_proxy_connectivity("http://127.0.0.1:7890")
+        finally:
+            proxy_module.httpx.AsyncClient = old_async_client
+
+        self.assertFalse(ok)
+        self.assertIn("407", message)
+
+    async def test_connectivity_rejects_network_error(self):
+        from backend.core import upstream_proxy as proxy_module
+
+        class FakeAsyncClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc_info):
+                return False
+
+            async def get(self, *_args, **_kwargs):
+                raise httpx.ProxyError("proxy connect failed")
+
+        old_async_client = proxy_module.httpx.AsyncClient
+        proxy_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            ok, message = await test_proxy_connectivity("http://127.0.0.1:7890")
+        finally:
+            proxy_module.httpx.AsyncClient = old_async_client
+
+        self.assertFalse(ok)
+        self.assertIn("ProxyError", message)
+
+
+class AdminProxySettingsTests(ProxySettingsMixin, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        from backend.api import admin as admin_module
+
+        self.admin_module = admin_module
+        self.old_test_proxy_connectivity = admin_module.test_proxy_connectivity
+
+    def tearDown(self):
+        self.admin_module.test_proxy_connectivity = self.old_test_proxy_connectivity
+        super().tearDown()
+
+    @staticmethod
+    def _request(client=None):
+        state = types.SimpleNamespace(qwen_client=client)
+        return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
+
+    async def test_disabled_proxy_update_skips_connectivity_test(self):
+        calls = []
+
+        async def fake_test(proxy_template):
+            calls.append(proxy_template)
+            return True, "ok"
+
+        self.admin_module.test_proxy_connectivity = fake_test
+        settings.QWEN_PROXY_ENABLED = True
+        settings.QWEN_UPSTREAM_PROXY = "http://old:7890"
+
+        await self.admin_module.update_settings(
+            {"qwen_proxy_enabled": False, "qwen_upstream_proxy": "http://new:7890"},
+            self._request(),
+        )
+
+        self.assertEqual(calls, [])
+        self.assertFalse(settings.QWEN_PROXY_ENABLED)
+        self.assertEqual(settings.QWEN_UPSTREAM_PROXY, "http://new:7890")
+
+    async def test_proxy_update_saves_only_after_successful_test(self):
+        calls = []
+
+        async def fake_test(proxy_template):
+            calls.append(proxy_template)
+            return True, "ok"
+
+        class FakeClient:
+            def __init__(self):
+                self.reset_count = 0
+
+            async def reset_proxy_runtime(self):
+                self.reset_count += 1
+
+        self.admin_module.test_proxy_connectivity = fake_test
+        client = FakeClient()
+
+        await self.admin_module.update_settings(
+            {"qwen_proxy_enabled": True, "qwen_upstream_proxy": "http://ok:7890"},
+            self._request(client),
+        )
+
+        self.assertEqual(calls, ["http://ok:7890"])
+        self.assertTrue(settings.QWEN_PROXY_ENABLED)
+        self.assertEqual(settings.QWEN_UPSTREAM_PROXY, "http://ok:7890")
+        self.assertEqual(client.reset_count, 1)
+
+    async def test_proxy_update_failure_keeps_old_config(self):
+        async def fake_test(_proxy_template):
+            return False, "代理测试失败"
+
+        class FakeClient:
+            async def reset_proxy_runtime(self):
+                raise AssertionError("不应重置代理运行时")
+
+        self.admin_module.test_proxy_connectivity = fake_test
+        settings.QWEN_PROXY_ENABLED = True
+        settings.QWEN_UPSTREAM_PROXY = "http://old:7890"
+
+        with self.assertRaises(HTTPException) as ctx:
+            await self.admin_module.update_settings(
+                {"qwen_proxy_enabled": True, "qwen_upstream_proxy": "http://bad:7890"},
+                self._request(FakeClient()),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertTrue(settings.QWEN_PROXY_ENABLED)
+        self.assertEqual(settings.QWEN_UPSTREAM_PROXY, "http://old:7890")
+
+    async def test_settings_returns_plain_proxy_and_removed_fields_absent(self):
+        settings.QWEN_PROXY_ENABLED = True
+        settings.QWEN_UPSTREAM_PROXY = "http://user:secret@127.0.0.1:7890"
+        request = self._request()
+        request.app.state.config_db = AsyncJsonDB("/tmp/qwen2api-test-config.json", default_data={})
+        request.app.state.chat_id_pool = None
+        request.app.state.account_pool = None
+        request.app.state.keepalive_service = None
+
+        payload = await self.admin_module.get_settings(request)
+
+        self.assertEqual(payload["qwen_upstream_proxy"], "http://user:secret@127.0.0.1:7890")
+        self.assertNotIn("qwen_upstream_proxy_masked", payload)
+        self.assertNotIn("qwen_proxy_pool_bind_per_account", payload)
+        self.assertNotIn("qwen_proxy_failure_cooldown_seconds", payload)
 
 
 class QwenClientProxyTests(ProxySettingsMixin, unittest.IsolatedAsyncioTestCase):

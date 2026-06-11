@@ -26,8 +26,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CHAT_ID_PREWARM_LARGE_POOL_ENABLED=false \
     QWEN_UPSTREAM_PROXY="" \
     QWEN_PROXY_ENABLED=false \
-    QWEN_PROXY_POOL_BIND_PER_ACCOUNT=true \
-    QWEN_PROXY_FAILURE_COOLDOWN_SECONDS=300 \
     PYTHONPATH=/workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

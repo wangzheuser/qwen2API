@@ -27,13 +27,11 @@ interface AdminSettings {
   keepalive_running?: boolean
   model_aliases?: ModelAliases
   qwen_proxy_enabled?: boolean
+  qwen_upstream_proxy?: string
   qwen_upstream_proxy_configured?: boolean
-  qwen_upstream_proxy_masked?: string
   qwen_proxy_template_mode?: boolean
   qwen_proxy_bound_accounts?: number
   qwen_proxy_failures_total?: number
-  qwen_proxy_pool_bind_per_account?: boolean
-  qwen_proxy_failure_cooldown_seconds?: number
 }
 
 export default function SettingsPage() {
@@ -50,8 +48,7 @@ export default function SettingsPage() {
   const [modelAliases, setModelAliases] = useState("")
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [proxyInput, setProxyInput] = useState("")
-  const [proxyBindPerAccount, setProxyBindPerAccount] = useState(true)
-  const [proxyFailureCooldown, setProxyFailureCooldown] = useState(300)
+  const [proxySaving, setProxySaving] = useState(false)
   const [models, setModels] = useState<ModelOption[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
 
@@ -73,9 +70,7 @@ export default function SettingsPage() {
         setKeepaliveRunning(Boolean(data.keepalive_running))
         setModelAliases(JSON.stringify(data.model_aliases || {}, null, 2))
         setProxyEnabled(Boolean(data.qwen_proxy_enabled))
-        setProxyInput("")
-        setProxyBindPerAccount(data.qwen_proxy_pool_bind_per_account !== false)
-        setProxyFailureCooldown(data.qwen_proxy_failure_cooldown_seconds || 300)
+        setProxyInput(data.qwen_upstream_proxy || "")
       })
       .catch(() => toast.error("配置获取失败，请检查会话 Key"))
   }, [])
@@ -140,14 +135,11 @@ export default function SettingsPage() {
   }
 
   const handleSaveProxy = () => {
+    setProxySaving(true)
+    const id = toast.loading(proxyEnabled && proxyInput.trim() ? "正在测试代理..." : "正在保存代理设置...")
     const body: Record<string, unknown> = {
       qwen_proxy_enabled: proxyEnabled,
-      qwen_proxy_pool_bind_per_account: proxyBindPerAccount,
-      qwen_proxy_failure_cooldown_seconds: Number(proxyFailureCooldown),
-    }
-    // 代理包含密码，后端不会回显明文；只有填写时才覆盖当前代理模板。
-    if (proxyInput.trim()) {
-      body.qwen_upstream_proxy = proxyInput.trim()
+      qwen_upstream_proxy: proxyInput.trim(),
     }
     fetch(`${API_BASE}/api/admin/settings`, {
       method: "PUT",
@@ -155,9 +147,10 @@ export default function SettingsPage() {
       body: JSON.stringify(body)
     }).then(async res => {
       const data = await res.json().catch(() => ({}))
-      if(res.ok) { toast.success("上游代理配置已保存（运行时立即生效）"); fetchSettings(); }
-      else toast.error(data.detail || "保存失败")
-    }).catch(() => toast.error("保存失败"))
+      if(res.ok) { toast.success("上游代理配置已保存（运行时立即生效）", { id }); fetchSettings(); }
+      else toast.error(data.detail || "代理测试失败，未保存配置", { id, duration: 8000 })
+    }).catch(() => toast.error("保存失败", { id }))
+      .finally(() => setProxySaving(false))
   }
 
   const handleClearProxy = () => {
@@ -542,38 +535,16 @@ export default function SettingsPage() {
             <div className="space-y-2">
               <label className="text-sm font-medium">代理模板</label>
               <input
-                type="password"
+                type="text"
                 value={proxyInput}
                 onChange={e => setProxyInput(e.target.value)}
-                placeholder={settings?.qwen_upstream_proxy_masked || "http://127.0.0.1:7890"}
+                placeholder="http://127.0.0.1:7890"
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono"
               />
               <p className="text-xs text-muted-foreground">
-                后端只回显脱敏值：{settings?.qwen_upstream_proxy_configured ? settings?.qwen_upstream_proxy_masked || "已配置" : "未配置"}。
-                留空保存不会覆盖现有代理；如需清空请点击“清空代理”。
+                当前代理模板会明文展示，仅管理员可见。包含 {"{uuid}"} 时自动作为代理池模板，并为每个账号运行时绑定一个解析后的节点。
+                {settings?.qwen_upstream_proxy_configured ? "" : " 当前未配置代理。"}
               </p>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <label className="flex items-center gap-2 rounded-lg border bg-background/60 p-3 text-sm">
-                <input
-                  type="checkbox"
-                  checked={proxyBindPerAccount}
-                  onChange={e => setProxyBindPerAccount(e.target.checked)}
-                  className="h-4 w-4"
-                />
-                按账号绑定 {"{uuid}"} 代理
-              </label>
-              <div className="flex items-center justify-between gap-3 rounded-lg border bg-background/60 p-3 text-sm">
-                <span>失败冷却（秒）</span>
-                <input
-                  type="number"
-                  min="0"
-                  max="86400"
-                  value={proxyFailureCooldown}
-                  onChange={e => setProxyFailureCooldown(Number(e.target.value))}
-                  className="flex h-8 w-24 rounded-md border border-input bg-background px-3 py-1 text-sm text-center"
-                />
-              </div>
             </div>
             <div className="grid gap-2 text-xs text-muted-foreground md:grid-cols-3">
               <div>模板模式：{settings?.qwen_proxy_template_mode ? "是" : "否"}</div>
@@ -582,7 +553,9 @@ export default function SettingsPage() {
             </div>
             <div className="flex justify-end gap-2">
               <Button variant="outline" size="sm" onClick={handleClearProxy}>清空代理</Button>
-              <Button size="sm" onClick={handleSaveProxy}>保存代理设置</Button>
+              <Button size="sm" onClick={handleSaveProxy} disabled={proxySaving}>
+                {proxySaving ? "正在测试..." : "保存代理设置"}
+              </Button>
             </div>
           </div>
         </div>

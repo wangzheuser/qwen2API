@@ -12,7 +12,7 @@ from backend.core.config import (
 )
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool
-from backend.core.upstream_proxy import clear_proxy_bindings, proxy_status
+from backend.core.upstream_proxy import clear_proxy_bindings, proxy_status, test_proxy_connectivity
 import secrets
 
 router = APIRouter()
@@ -379,6 +379,7 @@ async def get_settings(request: Request):
     acc_pool = getattr(request.app.state, "account_pool", None)
     keepalive_config = await get_keepalive_config(request.app.state.config_db)
     keepalive_service = getattr(request.app.state, "keepalive_service", None)
+    proxy_stats = proxy_status()
     return {
         "version": "2.0.0",
         "max_inflight_per_account": backend_settings.MAX_INFLIGHT_PER_ACCOUNT,
@@ -395,13 +396,11 @@ async def get_settings(request: Request):
         "auto_heal_on_auth_failure": backend_settings.AUTO_HEAL_ON_AUTH_FAILURE,
         "auto_heal_cooldown_seconds": backend_settings.AUTO_HEAL_COOLDOWN_SECONDS,
         "qwen_proxy_enabled": backend_settings.QWEN_PROXY_ENABLED,
+        "qwen_upstream_proxy": backend_settings.QWEN_UPSTREAM_PROXY,
         "qwen_upstream_proxy_configured": bool(backend_settings.QWEN_UPSTREAM_PROXY),
-        "qwen_upstream_proxy_masked": proxy_status().get("masked_proxy", ""),
-        "qwen_proxy_template_mode": proxy_status().get("template_mode", False),
-        "qwen_proxy_bound_accounts": proxy_status().get("bound_accounts", 0),
-        "qwen_proxy_failures_total": proxy_status().get("failures_total", 0),
-        "qwen_proxy_pool_bind_per_account": backend_settings.QWEN_PROXY_POOL_BIND_PER_ACCOUNT,
-        "qwen_proxy_failure_cooldown_seconds": backend_settings.QWEN_PROXY_FAILURE_COOLDOWN_SECONDS,
+        "qwen_proxy_template_mode": proxy_stats.get("template_mode", False),
+        "qwen_proxy_bound_accounts": proxy_stats.get("bound_accounts", 0),
+        "qwen_proxy_failures_total": proxy_stats.get("failures_total", 0),
         "keepalive_url": keepalive_config["keepalive_url"],
         "keepalive_interval": keepalive_config["keepalive_interval"],
         "keepalive_env_locked": keepalive_config["env_locked"],
@@ -414,6 +413,23 @@ async def get_settings(request: Request):
 async def update_settings(data: dict, request: Request):
     from backend.core.config import MODEL_MAP
     proxy_changed = False
+    proxy_keys = {"qwen_proxy_enabled", "qwen_upstream_proxy"}
+    proxy_update_requested = any(key in data for key in proxy_keys)
+    next_proxy_enabled = settings.QWEN_PROXY_ENABLED
+    next_upstream_proxy = settings.QWEN_UPSTREAM_PROXY
+
+    if "qwen_proxy_enabled" in data:
+        next_proxy_enabled = _parse_bool(data.get("qwen_proxy_enabled"), False)
+    if "qwen_upstream_proxy" in data:
+        value = data.get("qwen_upstream_proxy")
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail="Qwen 上游代理必须是字符串")
+        next_upstream_proxy = value.strip()
+    if proxy_update_requested and next_proxy_enabled and next_upstream_proxy:
+        ok, message = await test_proxy_connectivity(next_upstream_proxy)
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+
     if "max_inflight_per_account" in data:
         try:
             val = int(data["max_inflight_per_account"])
@@ -446,24 +462,10 @@ async def update_settings(data: dict, request: Request):
             pass
     if "chat_id_pool_large_pool_enabled" in data:
         settings.CHAT_ID_PREWARM_LARGE_POOL_ENABLED = _parse_bool(data.get("chat_id_pool_large_pool_enabled"), False)
-    if "qwen_proxy_enabled" in data:
-        settings.QWEN_PROXY_ENABLED = _parse_bool(data.get("qwen_proxy_enabled"), False)
+    if proxy_update_requested:
+        settings.QWEN_PROXY_ENABLED = next_proxy_enabled
+        settings.QWEN_UPSTREAM_PROXY = next_upstream_proxy
         proxy_changed = True
-    if "qwen_upstream_proxy" in data:
-        value = data.get("qwen_upstream_proxy")
-        if not isinstance(value, str):
-            raise HTTPException(status_code=400, detail="Qwen 上游代理必须是字符串")
-        settings.QWEN_UPSTREAM_PROXY = value.strip()
-        proxy_changed = True
-    if "qwen_proxy_pool_bind_per_account" in data:
-        settings.QWEN_PROXY_POOL_BIND_PER_ACCOUNT = _parse_bool(data.get("qwen_proxy_pool_bind_per_account"), True)
-        proxy_changed = True
-    if "qwen_proxy_failure_cooldown_seconds" in data:
-        try:
-            settings.QWEN_PROXY_FAILURE_COOLDOWN_SECONDS = max(0, int(data["qwen_proxy_failure_cooldown_seconds"]))
-            proxy_changed = True
-        except (TypeError, ValueError):
-            pass
     if "global_max_inflight" in data:
         try:
             val = int(data["global_max_inflight"])
