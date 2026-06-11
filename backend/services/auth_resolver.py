@@ -736,19 +736,63 @@ class AuthResolver:
     def __init__(self, pool: AccountPool):
         self.pool = pool
 
-    async def auto_heal_account(self, acc: Account):
+    def _set_heal_cooldown(self, acc: Account) -> None:
+        """记录账号自愈失败后的冷却时间。"""
+        cooldown = max(0, int(getattr(settings, "AUTO_HEAL_COOLDOWN_SECONDS", 1800) or 0))
+        acc.heal_cooldown_until = time.time() + cooldown if cooldown else 0.0
+
+    def _can_auto_heal(self, acc: Account) -> bool:
+        """检查请求链路是否允许为账号排队自动自愈。"""
+        if not getattr(settings, "AUTO_HEAL_ON_AUTH_FAILURE", False):
+            return False
+        if getattr(acc, "healing", False):
+            return False
+        now = time.time()
+        cooldown_until = float(getattr(acc, "heal_cooldown_until", 0.0) or 0.0)
+        if cooldown_until > now:
+            log.info("[BGRefresh] %s auto heal skipped in cooldown %.0fs", acc.email, cooldown_until - now)
+            return False
+        if not getattr(acc, "password", "") and not getattr(acc, "activation_pending", False):
+            log.info("[BGRefresh] %s auto heal skipped: missing password and not pending activation", acc.email)
+            return False
+        return True
+
+    def schedule_auto_heal(self, acc: Account) -> bool:
+        """按配置排队自动自愈，避免请求路径无上限拉起浏览器。"""
+        if not self._can_auto_heal(acc):
+            return False
+        acc.healing = True
+
+        async def runner() -> None:
+            await self.auto_heal_account(acc, scheduled=True)
+
+        try:
+            task = asyncio.create_task(runner())
+            task.set_name(f"auto-heal-{acc.email}")
+            return True
+        except RuntimeError:
+            acc.healing = False
+            return False
+
+    async def auto_heal_account(self, acc: Account, *, scheduled: bool = False):
         """Background task to refresh token. If successful, marks account valid.
         If refresh fails or account is pending activation, tries to activate via email."""
-        if getattr(acc, "healing", False):
+        if not scheduled and getattr(acc, "healing", False):
             log.info(f"[BGRefresh] {acc.email} healing already in progress")
             return
 
-        acc.healing = True
+        if not scheduled:
+            if not getattr(acc, "password", "") and not getattr(acc, "activation_pending", False):
+                log.info(f"[BGRefresh] {acc.email} skip auto heal: missing password and not pending activation")
+                return
+            acc.healing = True
         try:
-            ok = await self.refresh_token(acc)
+            ok = await self.refresh_token(acc, save=False)
             if ok:
                 if not getattr(acc, 'activation_pending', False):
                     acc.valid = True
+                    acc.heal_cooldown_until = 0.0
+                    self.pool.reindex_account(acc)
                     await self.pool.save()
                     log.info(f"[自愈] {acc.email} Token 刷新成功，已标记有效")
                     return
@@ -760,16 +804,22 @@ class AuthResolver:
             if activated:
                 acc.activation_pending = False
                 acc.valid = True
+                acc.heal_cooldown_until = 0.0
+                self.pool.reindex_account(acc)
                 await self.pool.save()
                 log.info(f"[自愈] {acc.email} 激活成功，已保存")
             else:
+                self._set_heal_cooldown(acc)
+                await self.pool.save()
                 log.warning(f"[自愈] {acc.email} 激活失败")
         except Exception as e:
+            self._set_heal_cooldown(acc)
+            await self.pool.save()
             log.warning(f"[BGRefresh] {acc.email} auto heal failed: {e}")
         finally:
             acc.healing = False
 
-    async def refresh_token(self, acc: Account) -> bool:
+    async def refresh_token(self, acc: Account, *, save: bool = True) -> bool:
 
         """Re-login on chat.qwen.ai with email+password and persist a verified token."""
         if not acc.email or not acc.password:
@@ -796,7 +846,10 @@ class AuthResolver:
                 acc.activation_pending = False
                 acc.status_code = "valid"
                 acc.last_error = "Token 已通过官网登录刷新"
-                await self.pool.save()
+                acc.heal_cooldown_until = 0.0
+                self.pool.reindex_account(acc)
+                if save:
+                    await self.pool.save()
                 if new_token != old_token:
                     log.info(f"[Refresh] {acc.email} token 已更新 ({old_prefix}... → {new_token[:20]}...)")
                 else:

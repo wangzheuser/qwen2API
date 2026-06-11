@@ -20,6 +20,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=7860 \
     WORKERS=1 \
     LOG_LEVEL=INFO \
+    AUTO_HEAL_ON_AUTH_FAILURE=false \
+    AUTO_HEAL_COOLDOWN_SECONDS=1800 \
+    CHAT_ID_PREWARM_LARGE_POOL_THRESHOLD=200 \
+    CHAT_ID_PREWARM_LARGE_POOL_ENABLED=false \
     PYTHONPATH=/workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

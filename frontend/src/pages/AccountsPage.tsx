@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, Lock } from "lucide-react"
+import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, Lock, Wrench } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -19,6 +19,15 @@ type AccountItem = {
   last_error?: string
   source?: string
   env_name?: string
+}
+
+type AccountSummary = {
+  total?: number
+  valid?: number
+  rate_limited?: number
+  invalid?: number
+  activation_pending?: number
+  banned?: number
 }
 
 function statusStyle(code?: string) {
@@ -79,6 +88,11 @@ async function sha256Hex(value: string) {
 
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState<AccountItem[]>([])
+  const [summary, setSummary] = useState<AccountSummary | null>(null)
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [pages, setPages] = useState(1)
+  const pageSize = 50
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [token, setToken] = useState("")
@@ -111,21 +125,37 @@ export default function AccountsPage() {
     }
   }, [email, password])
 
-  const fetchAccounts = () => {
-    fetch(`${API_BASE}/api/admin/accounts`, { headers: getAuthHeader() })
+  const fetchAccounts = (targetPage = page) => {
+    fetch(`${API_BASE}/api/admin/accounts?page=${targetPage}&page_size=${pageSize}`, { headers: getAuthHeader() })
       .then(res => {
         if (!res.ok) throw new Error("unauthorized")
         return res.json()
       })
-      .then(data => setAccounts(data.accounts || []))
+      .then(data => {
+        setAccounts(data.accounts || [])
+        setSummary(data.summary || null)
+        setTotal(data.total || 0)
+        setPages(data.pages || 1)
+        if (data.page && data.page !== page) setPage(data.page)
+      })
       .catch(() => toast.error("\u5237\u65b0\u8d26\u53f7\u5217\u8868\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u4f1a\u8bdd\u5bc6\u94a5"))
   }
 
   useEffect(() => {
-    fetchAccounts()
-  }, [])
+    fetchAccounts(page)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page])
 
   const stats = useMemo(() => {
+    if (summary) {
+      return {
+        valid: summary.valid || 0,
+        pending: summary.activation_pending || 0,
+        rateLimited: summary.rate_limited || 0,
+        banned: summary.banned || 0,
+        invalid: Math.max(0, (summary.invalid || 0) - (summary.activation_pending || 0) - (summary.banned || 0)),
+      }
+    }
     const result = { valid: 0, pending: 0, rateLimited: 0, banned: 0, invalid: 0 }
     for (const acc of accounts) {
       switch (acc.status_code) {
@@ -137,7 +167,7 @@ export default function AccountsPage() {
       }
     }
     return result
-  }, [accounts])
+  }, [accounts, summary])
 
   const handleAdd = () => {
     if (!token.trim()) {
@@ -211,28 +241,28 @@ export default function AccountsPage() {
       .finally(() => setRegistering(false))
   }
 
-  const handleVerify = (targetEmail: string) => {
+  const handleVerify = (targetEmail: string, repair = false) => {
     setVerifying(targetEmail)
-    const id = toast.loading(`\u6b63\u5728\u9a8c\u8bc1 ${targetEmail}...`)
-    fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail)}/verify`, {
+    const id = toast.loading(`${repair ? "\u6b63\u5728\u4fee\u590d" : "\u6b63\u5728\u9a8c\u8bc1"} ${targetEmail}...`)
+    fetch(`${API_BASE}/api/admin/accounts/${encodeURIComponent(targetEmail)}/verify${repair ? "?repair=true" : ""}`, {
       method: "POST",
       headers: getAuthHeader(),
     }).then(res => res.json())
       .then(data => {
         if (data.valid) {
-          toast.success(`\u9a8c\u8bc1\u901a\u8fc7\uff1a${targetEmail}`, { id })
+          toast.success(`${repair ? "\u4fee\u590d\u6210\u529f" : "\u9a8c\u8bc1\u901a\u8fc7"}\uff1a${targetEmail}`, { id })
         } else {
-          toast.error(`\u9a8c\u8bc1\u5931\u8d25\uff1a${statusText(data) || localizeError(data.error)}`, { id, duration: 8000 })
+          toast.error(`${repair ? "\u4fee\u590d" : "\u9a8c\u8bc1"}\u5931\u8d25\uff1a${statusText(data) || localizeError(data.error)}`, { id, duration: 8000 })
         }
         fetchAccounts()
       })
-      .catch(() => toast.error("\u9a8c\u8bc1\u8bf7\u6c42\u5931\u8d25", { id }))
+      .catch(() => toast.error(`${repair ? "\u4fee\u590d" : "\u9a8c\u8bc1"}\u8bf7\u6c42\u5931\u8d25`, { id }))
       .finally(() => setVerifying(null))
   }
 
   const handleVerifyAll = () => {
     setVerifyingAll(true)
-    const id = toast.loading("\u6b63\u5728\u5e76\u53d1\u5de1\u68c0\u6240\u6709\u8d26\u53f7...")
+    const id = toast.loading("\u6b63\u5728\u5de1\u68c0\u6240\u6709\u8d26\u53f7\uff08\u4e0d\u62c9\u8d77\u6d4f\u89c8\u5668\uff09...")
     fetch(`${API_BASE}/api/admin/verify`, {
       method: "POST",
       headers: getAuthHeader(),
@@ -241,7 +271,7 @@ export default function AccountsPage() {
         if (data.ok) {
           toast.success(`\u5168\u91cf\u5de1\u68c0\u5b8c\u6210\uff0c\u5e76\u53d1\u6570\uff1a${data.concurrency || 1}`, { id })
         } else {
-          toast.error("\u5168\u91cf\u5de1\u68c0\u5931\u8d25", { id })
+          toast.error(data.detail || "\u5168\u91cf\u5de1\u68c0\u5931\u8d25", { id })
         }
         fetchAccounts()
       })
@@ -330,7 +360,9 @@ export default function AccountsPage() {
       <div className="rounded-2xl border bg-card/30 overflow-hidden">
         <div className="flex items-center justify-between p-6 border-b bg-muted/10">
           <h3 className="text-xl font-bold">{"\u8d26\u53f7\u5217\u8868"}</h3>
-          <span className="inline-flex items-center justify-center bg-primary/10 text-primary rounded-full px-3 py-1 text-xs font-bold">{accounts.length}</span>
+          <span className="inline-flex items-center justify-center bg-primary/10 text-primary rounded-full px-3 py-1 text-xs font-bold">
+            {accounts.length} / {total}
+          </span>
         </div>
         <table className="w-full text-sm text-left">
           <thead className="bg-muted/30 border-b text-muted-foreground text-xs uppercase tracking-wider font-semibold">
@@ -380,6 +412,11 @@ export default function AccountsPage() {
                         <MailWarning className="h-4 w-4 mr-1" /> {"\u6fc0\u6d3b"}
                       </Button>
                     )}
+                    {acc.status_code !== "valid" && acc.status_code !== "rate_limited" && acc.status_code !== "banned" && (
+                      <Button variant="outline" size="sm" onClick={() => handleVerify(acc.email, true)} disabled={verifying === acc.email} title={"\u4fee\u590d\uff08\u53ef\u80fd\u62c9\u8d77\u53d7\u9650\u7684\u65e0\u5934\u6d4f\u89c8\u5668\uff09"}>
+                        <Wrench className="h-4 w-4" />
+                      </Button>
+                    )}
                     <Button variant="outline" size="sm" onClick={() => handleVerify(acc.email)} disabled={verifying === acc.email} title={"\u5355\u72ec\u9a8c\u8bc1"}>
                       {verifying === acc.email ? <RefreshCw className="h-4 w-4 animate-spin text-blue-500" /> : <ShieldCheck className="h-4 w-4" />}
                     </Button>
@@ -399,6 +436,19 @@ export default function AccountsPage() {
             ))}
           </tbody>
         </table>
+        <div className="flex items-center justify-between gap-3 border-t bg-muted/10 px-6 py-4 text-sm">
+          <div className="text-muted-foreground">
+            {total === 0 ? "\u5171 0 \u4e2a\u8d26\u53f7" : `\u7b2c ${page} / ${pages} \u9875\uff0c\u6bcf\u9875 ${pageSize} \u4e2a\uff0c\u5171 ${total} \u4e2a`}
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(prev => Math.max(1, prev - 1))}>
+              {"\u4e0a\u4e00\u9875"}
+            </Button>
+            <Button variant="outline" size="sm" disabled={page >= pages} onClick={() => setPage(prev => Math.min(pages, prev + 1))}>
+              {"\u4e0b\u4e00\u9875"}
+            </Button>
+          </div>
+        </div>
       </div>
     </div>
   )

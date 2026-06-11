@@ -23,6 +23,10 @@ services:
       ACCOUNT_MIN_INTERVAL_MS: "0"
       REQUEST_JITTER_MIN_MS: "0"
       REQUEST_JITTER_MAX_MS: "0"
+      AUTO_HEAL_ON_AUTH_FAILURE: "false"
+      AUTO_HEAL_COOLDOWN_SECONDS: "1800"
+      CHAT_ID_PREWARM_LARGE_POOL_THRESHOLD: "200"
+      CHAT_ID_PREWARM_LARGE_POOL_ENABLED: "false"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7860/healthz || exit 1"]
       interval: 30s

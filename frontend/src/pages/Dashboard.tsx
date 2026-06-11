@@ -4,16 +4,6 @@ import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
 
-type AccountRow = {
-  email: string
-  status: string
-  inflight: number
-  max_inflight: number
-  consecutive_failures: number
-  rate_limit_strikes: number
-  last_request_finished: number
-}
-
 type Status = {
   accounts?: {
     total?: number
@@ -22,17 +12,27 @@ type Status = {
     invalid?: number
     in_use?: number
     global_in_use?: number
+    global_max_inflight?: number
     waiting?: number
     max_inflight_per_account?: number
     max_queue_size?: number
   }
-  per_account?: AccountRow[]
   chat_id_pool?: {
     total_cached?: number
     target_per_account?: number
+    configured_target_per_account?: number
     ttl_seconds?: number
-    per_account?: Record<string, number>
+    large_pool_suppressed?: boolean
   } | null
+  browser_automation?: {
+    metrics?: {
+      limit?: number
+      active?: number
+      waiting?: number
+      launched_total?: number
+      failed_total?: number
+    }
+  }
   runtime?: { asyncio_running_tasks?: number }
 }
 
@@ -62,7 +62,7 @@ export default function Dashboard() {
 
   const acc = status?.accounts || {}
   const pool = status?.chat_id_pool
-  const rows = status?.per_account || []
+  const browser = status?.browser_automation?.metrics || {}
 
   return (
     <div className="space-y-8 max-w-5xl relative">
@@ -74,65 +74,15 @@ export default function Dashboard() {
 
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4 relative z-10">
         <StatCard icon={<Server className="h-5 w-5 text-primary" />} title="可用账号" value={String(acc.valid ?? 0)} accent="primary" sub={`共 ${acc.total ?? 0} 个`} />
-        <StatCard icon={<Activity className="h-5 w-5 text-blue-400" />} title="当前并发" value={String(acc.in_use ?? 0)} accent="blue" sub={`全局上限 ${acc.global_in_use ?? 0}`} />
+        <StatCard icon={<Activity className="h-5 w-5 text-blue-400" />} title="当前并发" value={String(acc.in_use ?? 0)} accent="blue" sub={`全局 ${acc.global_in_use ?? 0} / ${acc.global_max_inflight ?? 0}`} />
         <StatCard icon={<ShieldAlert className="h-5 w-5 text-destructive" />} title="排队请求" value={String(acc.waiting ?? 0)} accent="destructive" sub={`队列上限 ${acc.max_queue_size ?? 0}`} />
         <StatCard icon={<ActivityIcon className="h-5 w-5 text-orange-400" />} title="限流号/失效号" value={`${acc.rate_limited ?? 0} / ${acc.invalid ?? 0}`} accent="orange" />
       </div>
 
       <div className="grid gap-6 md:grid-cols-2 relative z-10">
-        <StatCard icon={<Flame className="h-5 w-5 text-rose-400" />} title="Chat_ID 预热池" value={String(pool?.total_cached ?? 0)} accent="rose" sub={pool ? `每账号目标 ${pool.target_per_account}  · TTL ${Math.round((pool.ttl_seconds || 0) / 60)} 分钟` : "未启用"} />
-        <StatCard icon={<Database className="h-5 w-5 text-cyan-400" />} title="异步任务" value={String(status?.runtime?.asyncio_running_tasks ?? 0)} accent="cyan" sub="asyncio active task count" />
+        <StatCard icon={<Flame className="h-5 w-5 text-rose-400" />} title="Chat_ID 预热池" value={String(pool?.total_cached ?? 0)} accent="rose" sub={pool ? `实际目标 ${pool.target_per_account} / 配置 ${pool.configured_target_per_account ?? pool.target_per_account} · ${pool.large_pool_suppressed ? "大池已暂停" : `TTL ${Math.round((pool.ttl_seconds || 0) / 60)} 分钟`}` : "未启用"} />
+        <StatCard icon={<Database className="h-5 w-5 text-cyan-400" />} title="浏览器实例" value={String(browser.active ?? 0)} accent="cyan" sub={`等待 ${browser.waiting ?? 0} · 上限 ${browser.limit ?? 0} · 失败 ${browser.failed_total ?? 0}`} />
       </div>
-
-      {rows.length > 0 && (
-        <div className="rounded-2xl border border-border/50 bg-card/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-b from-black/[0.02] dark:from-white/[0.02] to-transparent pointer-events-none" />
-          <div className="flex flex-col space-y-2 p-6 border-b border-border/50 bg-muted/10 relative z-10">
-            <h3 className="font-extrabold text-xl tracking-tight flex items-center gap-3">
-              <span className="bg-primary w-2 h-6 rounded-full shadow-[0_0_10px_rgba(168,85,247,0.5)]"></span>
-              账号并发详情
-            </h3>
-          </div>
-          <div className="overflow-x-auto relative z-10">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/20 text-xs uppercase text-muted-foreground">
-                <tr>
-                  <th className="text-left px-6 py-3 font-semibold">邮箱</th>
-                  <th className="text-left px-4 py-3 font-semibold">状态</th>
-                  <th className="text-right px-4 py-3 font-semibold">在途</th>
-                  <th className="text-right px-4 py-3 font-semibold">预热 chat_id</th>
-                  <th className="text-right px-4 py-3 font-semibold">连失</th>
-                  <th className="text-right px-4 py-3 font-semibold">限流次</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border/40">
-                {rows.map(r => {
-                  const warmSize = pool?.per_account?.[r.email] ?? 0
-                  const badge = r.status === "valid" ? "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30"
-                              : r.status === "rate_limited" ? "bg-orange-500/15 text-orange-300 ring-orange-500/30"
-                              : "bg-red-500/15 text-red-300 ring-red-500/30"
-                  return (
-                    <tr key={r.email} className="hover:bg-muted/10 transition-colors">
-                      <td className="px-6 py-3 font-mono text-xs text-foreground/80 break-all">{r.email}</td>
-                      <td className="px-4 py-3">
-                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-bold ring-1 ${badge}`}>{r.status}</span>
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {r.inflight}<span className="text-muted-foreground">/{r.max_inflight}</span>
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        <span className={warmSize === 0 ? "text-muted-foreground" : "text-rose-400 font-semibold"}>{warmSize}</span>
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono text-xs">{r.consecutive_failures}</td>
-                      <td className="px-4 py-3 text-right font-mono text-xs">{r.rate_limit_strikes}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
 
       <div className="rounded-2xl border border-border/50 bg-card/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-b from-black/[0.02] dark:from-white/[0.02] to-transparent pointer-events-none" />

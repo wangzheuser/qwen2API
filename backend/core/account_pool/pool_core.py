@@ -48,6 +48,7 @@ class Account:
         self.last_request_finished = float(kwargs.get("last_request_finished", 0.0) or 0.0)
         self.consecutive_failures = int(kwargs.get("consecutive_failures", 0) or 0)
         self.rate_limit_strikes = int(kwargs.get("rate_limit_strikes", 0) or 0)
+        self.heal_cooldown_until = float(kwargs.get("heal_cooldown_until", 0.0) or 0.0)
         self._pool_heap_version = 0
 
     def is_rate_limited(self) -> bool:
@@ -101,6 +102,7 @@ class Account:
             "last_request_finished": self.last_request_finished,
             "consecutive_failures": self.consecutive_failures,
             "rate_limit_strikes": self.rate_limit_strikes,
+            "heal_cooldown_until": self.heal_cooldown_until,
         }
 
 
@@ -136,6 +138,7 @@ class AccountPool:
         self.ready_set_enabled = False
         self._valid_account_count = 0
         self._account_by_email: dict[str, Account] = {}
+        self._account_by_token: dict[str, Account] = {}
         self._ready_heap: list[tuple[float, float, float, int, str, int]] = []
         self._cooldown_heap: list[tuple[float, int, str, int]] = []
         self._heap_seq = 0
@@ -189,6 +192,7 @@ class AccountPool:
 
     def _rebuild_ready_set(self) -> None:
         self._account_by_email = {a.email: a for a in self.accounts if a.email}
+        self._account_by_token = {a.token: a for a in self.accounts if a.token}
         self._ready_heap = []
         self._cooldown_heap = []
         self._heap_seq = 0
@@ -305,6 +309,31 @@ class AccountPool:
         if account is not None:
             return account
         return next((a for a in self.accounts if a.email == email), None)
+
+    def get_by_token(self, token: str) -> Optional[Account]:
+        """按 token 查找账号；索引缺失时退化为一次线性扫描并回填。"""
+        if not token:
+            return None
+        account = self._account_by_token.get(token)
+        if account is not None and account.token == token:
+            return account
+        account = next((a for a in self.accounts if a.token == token), None)
+        if account is not None:
+            self._account_by_token[token] = account
+        return account
+
+    def reindex_account(self, acc: Account) -> None:
+        """账号邮箱或 token 变化后刷新快速索引。"""
+        if not acc:
+            return
+        if acc.email:
+            self._account_by_email[acc.email] = acc
+        # token 刷新后清理该账号旧 token 索引，再写入新 token。
+        stale_tokens = [token for token, item in self._account_by_token.items() if item is acc and token != acc.token]
+        for token in stale_tokens:
+            self._account_by_token.pop(token, None)
+        if acc.token:
+            self._account_by_token[acc.token] = acc
 
     def _can_acquire_global(self) -> bool:
         """检查全局并发限制"""

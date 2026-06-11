@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any
 
 log = logging.getLogger("qwen2api.db")
 
@@ -26,8 +28,8 @@ class AsyncJsonDB:
                 self._data = self.default_data
                 return self._data
             try:
-                # 为了不阻塞事件循环，本应用可使用 asyncio.to_thread 或者直接读，因为文件很小
-                content = self.path.read_text(encoding="utf-8")
+                # 大账号池下 JSON 文件可能较大，读文件放到线程池避免阻塞事件循环。
+                content = await asyncio.to_thread(self.path.read_text, encoding="utf-8")
                 self._data = json.loads(content)
             except Exception as e:
                 log.error(f"Failed to load JSON from {self.path}: {e}")
@@ -38,7 +40,8 @@ class AsyncJsonDB:
         async with self._lock:
             self._data = data
             try:
-                self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
+                # 先写临时文件再原子替换，避免进程异常时留下半截 JSON。
+                await asyncio.to_thread(self._write_atomic, self._data)
             except Exception as e:
                 log.error(f"Failed to save JSON to {self.path}: {e}")
 
@@ -46,3 +49,19 @@ class AsyncJsonDB:
         if self._data is None:
             return await self.load()
         return self._data
+
+    def _write_atomic(self, data: Any) -> None:
+        """在线程池中完成 JSON 序列化和原子落盘。"""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+        tmp_path = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, self.path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass

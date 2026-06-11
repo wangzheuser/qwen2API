@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, Header, Request
+import asyncio
+import math
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Header, Query, Request
 from pydantic import BaseModel
 from backend.core.config import (
     KEEPALIVE_MAX_INTERVAL,
@@ -8,10 +11,11 @@ from backend.core.config import (
     update_keepalive_config,
 )
 from backend.core.database import AsyncJsonDB
-from backend.core.account_pool import AccountPool, Account
+from backend.core.account_pool import AccountPool
 import secrets
 
 router = APIRouter()
+_verify_all_lock = asyncio.Lock()
 
 def verify_admin(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -40,22 +44,81 @@ class ApiKeyCreate(BaseModel):
     mode: str = "auto"
     key: str = ""
 
+def _parse_bool(value, default: bool = False) -> bool:
+    """解析查询参数或 JSON 字段中的布尔值。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _repair_requested(request: Request, default: bool = False) -> bool:
+    """读取 repair 开关；查询参数优先，其次兼容 JSON body。"""
+    if "repair" in request.query_params:
+        return _parse_bool(request.query_params.get("repair"), default)
+    try:
+        body = await request.json()
+    except Exception:
+        return default
+    if isinstance(body, dict) and "repair" in body:
+        return _parse_bool(body.get("repair"), default)
+    return default
+
+
+def _account_summary_item(acc, pool: AccountPool, *, include_secret: bool = False) -> dict:
+    """构造管理端账号条目，默认不返回敏感凭证。"""
+    item = {
+        "email": acc.email,
+        "username": acc.username,
+        "activation_pending": acc.activation_pending,
+        "status_code": acc.get_status_code(),
+        "status_text": acc.get_status_text(),
+        "last_error": acc.last_error,
+        "source": acc.source,
+        "env_name": acc.env_name,
+        "last_request_started": acc.last_request_started,
+        "last_request_finished": acc.last_request_finished,
+        "consecutive_failures": acc.consecutive_failures,
+        "rate_limit_strikes": acc.rate_limit_strikes,
+        "heal_cooldown_until": getattr(acc, "heal_cooldown_until", 0.0),
+        "valid": acc.valid,
+        "inflight": acc.inflight,
+        "rate_limited_until": acc.rate_limited_until,
+        "max_inflight": getattr(pool, "max_inflight_per_account", 0),
+    }
+    if include_secret:
+        item.update({
+            "password": acc.password,
+            "token": acc.token,
+            "cookies": acc.cookies,
+        })
+    return item
+
+
 @router.get("/status", dependencies=[Depends(verify_admin)])
-async def get_system_status(request: Request):
+async def get_system_status(
+    request: Request,
+    detail: bool = Query(False),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
     pool = request.app.state.account_pool
 
     # 账号层细粒度 inflight / 状态
     per_account = []
-    for acc in getattr(pool, "accounts", []):
-        per_account.append({
-            "email": acc.email,
-            "status": acc.get_status_code(),
-            "inflight": getattr(acc, "inflight", 0),
-            "max_inflight": getattr(pool, "max_inflight_per_account", 0),
-            "consecutive_failures": getattr(acc, "consecutive_failures", 0),
-            "rate_limit_strikes": getattr(acc, "rate_limit_strikes", 0),
-            "last_request_finished": getattr(acc, "last_request_finished", 0),
-        })
+    accounts = getattr(pool, "accounts", [])
+    if detail:
+        for acc in accounts[offset:offset + limit]:
+            per_account.append({
+                "email": acc.email,
+                "status": acc.get_status_code(),
+                "inflight": getattr(acc, "inflight", 0),
+                "max_inflight": getattr(pool, "max_inflight_per_account", 0),
+                "consecutive_failures": getattr(acc, "consecutive_failures", 0),
+                "rate_limit_strikes": getattr(acc, "rate_limit_strikes", 0),
+                "last_request_finished": getattr(acc, "last_request_finished", 0),
+            })
 
     # chat_id 预热池指标（若已启用）
     chat_id_pool_stats = None
@@ -63,14 +126,18 @@ async def get_system_status(request: Request):
     if cp is not None:
         try:
             per_account_pool: dict[str, int] = {}
-            for acc in getattr(pool, "accounts", []):
-                per_account_pool[acc.email] = await cp.size(acc.email)
+            if detail:
+                for acc in accounts[offset:offset + limit]:
+                    per_account_pool[acc.email] = await cp.size(acc.email)
             chat_id_pool_stats = {
                 "total_cached": await cp.total_size(),
-                "target_per_account": cp._target,
+                "target_per_account": cp.target,
+                "configured_target_per_account": getattr(cp, "configured_target", cp.target),
                 "ttl_seconds": cp._ttl,
-                "per_account": per_account_pool,
+                "large_pool_suppressed": cp.is_large_pool_prewarm_suppressed() if hasattr(cp, "is_large_pool_prewarm_suppressed") else False,
             }
+            if detail:
+                chat_id_pool_stats["per_account"] = per_account_pool
         except Exception:
             chat_id_pool_stats = {"error": "snapshot failed"}
 
@@ -82,9 +149,10 @@ async def get_system_status(request: Request):
     except Exception:
         running_tasks = -1
 
-    return {
+    from backend.core.browser_engine import get_browser_metrics
+
+    payload = {
         "accounts": pool.status(),
-        "per_account": per_account,
         "chat_id_pool": chat_id_pool_stats,
         "runtime": {
             "asyncio_running_tasks": running_tasks,
@@ -97,8 +165,17 @@ async def get_system_status(request: Request):
         "browser_automation": {
             "mode": "on_demand_registration_only",
             "description": "仅注册/激活/刷新 Token 时按需启动真实浏览器",
+            "metrics": get_browser_metrics(),
         }
     }
+    if detail:
+        payload["per_account"] = per_account
+        payload["pagination"] = {
+            "limit": limit,
+            "offset": offset,
+            "total": len(accounts),
+        }
+    return payload
 
 @router.get("/users", dependencies=[Depends(verify_admin)])
 async def list_users(request: Request):
@@ -156,17 +233,27 @@ async def add_account(request: Request):
 
 
 @router.get("/accounts", dependencies=[Depends(verify_admin)])
-async def list_accounts(request: Request):
+async def list_accounts(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    include_secret: bool = Query(False),
+):
     pool: AccountPool = request.app.state.account_pool
-    # 模拟原始 FastAPI 序列化，包含运行时状态
-    accs = []
-    for a in pool.accounts:
-        d = a.to_dict()
-        d["valid"] = a.valid
-        d["inflight"] = a.inflight
-        d["rate_limited_until"] = a.rate_limited_until
-        accs.append(d)
-    return {"accounts": accs}
+    accounts = list(pool.accounts)
+    total = len(accounts)
+    start = (page - 1) * page_size
+    end = start + page_size
+    accs = [_account_summary_item(a, pool, include_secret=include_secret) for a in accounts[start:end]]
+    return {
+        "accounts": accs,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, math.ceil(total / page_size)) if total else 1,
+        "has_more": end < total,
+        "summary": pool.status(),
+    }
 
 @router.post("/accounts/register", dependencies=[Depends(verify_admin)])
 async def register_new_account(request: Request):
@@ -198,25 +285,33 @@ async def register_new_account(request: Request):
 
 @router.post("/verify", dependencies=[Depends(verify_admin)])
 async def verify_all_accounts(request: Request):
-    """逐个到 chat.qwen.ai 官网验证账号；token 失效时自动刷新。"""
+    """逐个到 chat.qwen.ai 官网验证账号；repair=true 时才允许浏览器修复。"""
     from backend.core.account_pool import AccountPool
     from backend.services.qwen_client import QwenClient
 
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
+    repair = await _repair_requested(request)
 
-    results = []
-    for acc in pool.accounts:
-        results.append(await client.verify_account(acc))
+    if _verify_all_lock.locked():
+        raise HTTPException(status_code=409, detail="全量巡检正在进行中，请稍后再试")
+
+    async with _verify_all_lock:
+        results = []
+        for acc in pool.accounts:
+            results.append(await client.verify_account(acc, repair=repair, persist=False, reset_pool=False))
+        await pool.save()
+        pool._reset_concurrency_limits()
 
     summary = {
         "total": len(results),
         "valid": sum(1 for item in results if item.get("valid")),
         "refreshed": sum(1 for item in results if item.get("refreshed")),
+        "repaired": sum(1 for item in results if item.get("repaired")),
         "banned": sum(1 for item in results if item.get("status_code") == "banned"),
         "failed": sum(1 for item in results if not item.get("valid")),
     }
-    return {"ok": True, "results": results, "summary": summary, "concurrency": 1}
+    return {"ok": True, "results": results, "summary": summary, "concurrency": 1, "repair": repair}
 
 @router.post("/accounts/{email}/activate", dependencies=[Depends(verify_admin)])
 async def activate_account(email: str, request: Request):
@@ -225,7 +320,7 @@ async def activate_account(email: str, request: Request):
     from backend.core.account_pool import AccountPool
 
     pool: AccountPool = request.app.state.account_pool
-    acc = next((a for a in pool.accounts if a.email == email), None)
+    acc = pool.get_by_email(email)
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
 
@@ -247,24 +342,25 @@ async def activate_account(email: str, request: Request):
 
 @router.post("/accounts/{email}/verify", dependencies=[Depends(verify_admin)])
 async def verify_account(email: str, request: Request):
-    """单独到 chat.qwen.ai 官网验证账号；token 失效时自动刷新。"""
+    """单独到 chat.qwen.ai 官网验证账号；repair=true 时才允许浏览器修复。"""
     from backend.services.qwen_client import QwenClient
     from backend.core.account_pool import AccountPool
 
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
-    acc = next((a for a in pool.accounts if a.email == email), None)
+    acc = pool.get_by_email(email)
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    return await client.verify_account(acc)
+    repair = await _repair_requested(request)
+    return await client.verify_account(acc, repair=repair)
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])
 async def delete_account(email: str, request: Request):
     from backend.core.account_pool import AccountPool
     pool: AccountPool = request.app.state.account_pool
-    acc = next((a for a in pool.accounts if a.email == email), None)
+    acc = pool.get_by_email(email)
     if acc and getattr(acc, "source", "") == "env":
         raise HTTPException(status_code=400, detail="环境变量注入账号不能在面板删除，请移除对应环境变量后重启服务")
     await pool.remove(email)
@@ -288,8 +384,13 @@ async def get_settings(request: Request):
         "account_ready_set_threshold": backend_settings.ACCOUNT_READY_SET_THRESHOLD,
         "account_ready_set_enabled": getattr(acc_pool, "ready_set_enabled", False),
         "chat_id_pool_target": pool.target if pool else 0,
+        "chat_id_pool_configured_target": getattr(pool, "configured_target", pool.target) if pool else 0,
         "chat_id_pool_ttl_seconds": pool.ttl if pool else 0,
         "chat_id_pool_max_concurrency": pool.max_concurrency if pool else 0,
+        "chat_id_pool_large_pool_threshold": backend_settings.CHAT_ID_PREWARM_LARGE_POOL_THRESHOLD,
+        "chat_id_pool_large_pool_enabled": backend_settings.CHAT_ID_PREWARM_LARGE_POOL_ENABLED,
+        "auto_heal_on_auth_failure": backend_settings.AUTO_HEAL_ON_AUTH_FAILURE,
+        "auto_heal_cooldown_seconds": backend_settings.AUTO_HEAL_COOLDOWN_SECONDS,
         "keepalive_url": keepalive_config["keepalive_url"],
         "keepalive_interval": keepalive_config["keepalive_interval"],
         "keepalive_env_locked": keepalive_config["env_locked"],
@@ -319,6 +420,20 @@ async def update_settings(data: dict, request: Request):
                 pool._reset_concurrency_limits()
         except (TypeError, ValueError):
             pass
+    if "auto_heal_on_auth_failure" in data:
+        settings.AUTO_HEAL_ON_AUTH_FAILURE = _parse_bool(data.get("auto_heal_on_auth_failure"), False)
+    if "auto_heal_cooldown_seconds" in data:
+        try:
+            settings.AUTO_HEAL_COOLDOWN_SECONDS = max(0, int(data["auto_heal_cooldown_seconds"]))
+        except (TypeError, ValueError):
+            pass
+    if "chat_id_pool_large_pool_threshold" in data:
+        try:
+            settings.CHAT_ID_PREWARM_LARGE_POOL_THRESHOLD = max(1, int(data["chat_id_pool_large_pool_threshold"]))
+        except (TypeError, ValueError):
+            pass
+    if "chat_id_pool_large_pool_enabled" in data:
+        settings.CHAT_ID_PREWARM_LARGE_POOL_ENABLED = _parse_bool(data.get("chat_id_pool_large_pool_enabled"), False)
     if "global_max_inflight" in data:
         try:
             val = int(data["global_max_inflight"])
@@ -335,6 +450,10 @@ async def update_settings(data: dict, request: Request):
                 ttl_seconds=data.get("chat_id_pool_ttl_seconds"),
                 max_concurrency=data.get("chat_id_pool_max_concurrency"),
             )
+    if "chat_id_pool_large_pool_threshold" in data or "chat_id_pool_large_pool_enabled" in data:
+        cp = getattr(request.app.state, "chat_id_pool", None)
+        if cp is not None:
+            await cp.prune_to_target()
     if "keepalive_url" in data or "keepalive_interval" in data:
         if "keepalive_url" in data and not isinstance(data["keepalive_url"], str):
             raise HTTPException(status_code=400, detail="保活 URL 必须是字符串")

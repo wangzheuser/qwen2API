@@ -264,8 +264,8 @@ class QwenClient:
     async def verify_token_detail(self, token: str) -> dict:
         """Probe chat.qwen.ai auth endpoint and preserve the reason.
 
-        This is intentionally a direct official-site probe. Callers that manage accounts
-        should use verify_account(), which refreshes expired tokens and then probes again.
+        This is intentionally a direct official-site probe. Account repair is only
+        performed by verify_account(..., repair=True) to avoid surprise browser launches.
         """
         if not token:
             return {
@@ -360,20 +360,33 @@ class QwenClient:
             acc.activation_pending = False
         acc.consecutive_failures += 1
 
-    async def verify_account(self, acc) -> dict:
-        """Verify an account against chat.qwen.ai and refresh expired tokens.
+    async def _persist_account_state(self, acc, *, persist: bool, reset_pool: bool) -> None:
+        """按调用场景保存账号状态并刷新账号池索引。"""
+        if hasattr(self.account_pool, "reindex_account"):
+            self.account_pool.reindex_account(acc)
+        if persist:
+            await self.account_pool.save()
+        if reset_pool:
+            self.account_pool._reset_concurrency_limits()
 
-        Flow: probe current token on official site -> if expired and password exists,
-        open browser login to refresh token -> probe the refreshed token again. Only
-        explicit banned/disabled responses are reported as banned.
-        """
+    async def verify_account(
+        self,
+        acc,
+        *,
+        repair: bool = False,
+        persist: bool = True,
+        reset_pool: bool = True,
+    ) -> dict:
+        """校验账号状态；只有 repair=True 时才允许拉起浏览器修复。"""
         before_token = acc.token or ""
         result = {
             "email": acc.email,
             "valid": False,
             "refreshed": False,
+            "repaired": False,
             "refresh_attempted": False,
             "refresh_ok": False,
+            "repair_attempted": bool(repair),
             "status_code": "auth_error",
             "status_text": "认证失效",
             "error": "",
@@ -384,56 +397,84 @@ class QwenClient:
         result.update({k: first.get(k) for k in ("valid", "status_code", "status_text", "error", "upstream_status")})
         if first.get("valid") and first.get("status_code") == "valid":
             self._mark_account_valid(acc, "官网 token 验证通过")
-            await self.account_pool.save()
-            self.account_pool._reset_concurrency_limits()
+            await self._persist_account_state(acc, persist=persist, reset_pool=reset_pool)
+            result.update({"valid": True, "status_code": "valid", "status_text": "正常", "error": acc.last_error})
             return result
 
         if first.get("status_code") == "banned":
             self._mark_account_failed(acc, "banned", first.get("error", "账号疑似被封禁"))
-            await self.account_pool.save()
-            self.account_pool._reset_concurrency_limits()
+            await self._persist_account_state(acc, persist=persist, reset_pool=reset_pool)
             result.update({"valid": False, "status_code": "banned", "status_text": "封禁"})
             return result
 
-        if acc.password and self.auth_resolver is not None:
-            log.info(f"[校验] {acc.email} token 不可用/过期，正在打开官网登录刷新 token...")
-            result["refresh_attempted"] = True
-            refresh_ok = await self.auth_resolver.refresh_token(acc)
-            result["refresh_ok"] = refresh_ok
-            result["refreshed"] = bool(refresh_ok and acc.token and acc.token != before_token)
+        if repair and self.auth_resolver is not None:
+            if getattr(acc, "healing", False):
+                result.update({
+                    "valid": acc.valid,
+                    "status_code": acc.get_status_code(),
+                    "status_text": acc.get_status_text(),
+                    "error": "账号正在刷新或激活中，请稍后重试",
+                })
+                return result
 
-            if refresh_ok:
-                second = await self.verify_token_detail(acc.token)
-                result.update({k: second.get(k) for k in ("valid", "status_code", "status_text", "error", "upstream_status")})
-                if second.get("valid") and second.get("status_code") == "valid":
-                    self._mark_account_valid(
-                        acc,
-                        "官网验证通过，Token 已刷新" if result["refreshed"] else "官网验证通过，Token 仍有效",
-                    )
-                    await self.account_pool.save()
-                    self.account_pool._reset_concurrency_limits()
-                    result.update({"valid": True, "status_code": "valid", "status_text": "正常", "error": acc.last_error})
-                    return result
-                if second.get("status_code") == "banned":
-                    self._mark_account_failed(acc, "banned", second.get("error", "账号疑似被封禁"))
-                    await self.account_pool.save()
-                    self.account_pool._reset_concurrency_limits()
-                    result.update({"valid": False, "status_code": "banned", "status_text": "封禁"})
-                    return result
+            acc.healing = True
+            try:
+                if acc.password:
+                    log.info(f"[校验] {acc.email} token 不可用/过期，正在打开官网登录刷新 token...")
+                    result["refresh_attempted"] = True
+                    refresh_ok = await self.auth_resolver.refresh_token(acc, save=False)
+                    result["refresh_ok"] = refresh_ok
+                    result["refreshed"] = bool(refresh_ok and acc.token and acc.token != before_token)
+                else:
+                    refresh_ok = False
+
+                if refresh_ok:
+                    second = await self.verify_token_detail(acc.token)
+                    result.update({k: second.get(k) for k in ("valid", "status_code", "status_text", "error", "upstream_status")})
+                    if second.get("valid") and second.get("status_code") == "valid":
+                        self._mark_account_valid(
+                            acc,
+                            "官网验证通过，Token 已刷新" if result["refreshed"] else "官网验证通过，Token 仍有效",
+                        )
+                        result["repaired"] = True
+                        await self._persist_account_state(acc, persist=persist, reset_pool=reset_pool)
+                        result.update({"valid": True, "status_code": "valid", "status_text": "正常", "error": acc.last_error})
+                        return result
+                    if second.get("status_code") == "banned":
+                        self._mark_account_failed(acc, "banned", second.get("error", "账号疑似被封禁"))
+                        await self._persist_account_state(acc, persist=persist, reset_pool=reset_pool)
+                        result.update({"valid": False, "status_code": "banned", "status_text": "封禁"})
+                        return result
+
+                if getattr(acc, "activation_pending", False):
+                    from backend.services.auth_resolver import activate_account
+
+                    result["refresh_attempted"] = True
+                    activated = await activate_account(acc)
+                    if activated:
+                        acc.valid = True
+                        acc.activation_pending = False
+                        result["repaired"] = True
+                        await self._persist_account_state(acc, persist=persist, reset_pool=reset_pool)
+                        result.update({"valid": True, "status_code": "valid", "status_text": "正常", "error": "账号已激活"})
+                        return result
+            finally:
+                acc.healing = False
 
         final_status = "pending_activation" if getattr(acc, "activation_pending", False) else (result.get("status_code") or "auth_error")
         if final_status in ("unknown", "rate_limited"):
             # 未知/临时失败不要误报封禁，但也不能作为可用账号调度。
             final_status = "auth_error"
-        final_error = result.get("error") or "Token 失效，且自动刷新未成功"
-        if acc.password and result.get("refresh_attempted") and not result.get("refresh_ok"):
+        final_error = result.get("error") or "Token 失效"
+        if not repair:
+            final_error = f"{final_error}；未执行浏览器修复，如需修复请使用 repair=true"
+        elif acc.password and result.get("refresh_attempted") and not result.get("refresh_ok"):
             final_error = f"{final_error}；已尝试打开官网登录刷新但未获取到有效 Token"
         elif not acc.password:
             final_error = f"{final_error}；未保存密码，无法自动刷新 Token"
 
         self._mark_account_failed(acc, final_status, final_error)
-        await self.account_pool.save()
-        self.account_pool._reset_concurrency_limits()
+        await self._persist_account_state(acc, persist=persist, reset_pool=reset_pool)
         result.update({
             "valid": False,
             "status_code": acc.get_status_code(),

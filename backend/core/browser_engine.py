@@ -1,6 +1,9 @@
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
+
+from backend.core.config import settings
 
 _CAMOUFOX_OPTS = {
     "headless": True,
@@ -16,13 +19,78 @@ _CAMOUFOX_OPTS = {
     },
 }
 
+_browser_semaphore: asyncio.Semaphore | None = None
+_browser_semaphore_limit = 0
+_browser_active = 0
+_browser_waiting = 0
+_browser_launched_total = 0
+_browser_failed_total = 0
+
+
+def _browser_limit() -> int:
+    """返回当前进程允许同时运行的浏览器实例数。"""
+    return max(1, int(getattr(settings, "BROWSER_POOL_SIZE", 1) or 1))
+
+
+def _get_browser_semaphore() -> asyncio.Semaphore:
+    """懒加载浏览器信号量，支持测试中动态调整配置。"""
+    global _browser_semaphore, _browser_semaphore_limit
+    limit = _browser_limit()
+    if _browser_semaphore is None or _browser_semaphore_limit != limit:
+        _browser_semaphore = asyncio.Semaphore(limit)
+        _browser_semaphore_limit = limit
+    return _browser_semaphore
+
+
+def get_browser_metrics() -> dict[str, int]:
+    """返回 Camoufox/Playwright 运行指标，供管理面板展示。"""
+    return {
+        "limit": _browser_limit(),
+        "active": _browser_active,
+        "waiting": _browser_waiting,
+        "launched_total": _browser_launched_total,
+        "failed_total": _browser_failed_total,
+    }
+
 
 @asynccontextmanager
 async def _new_browser():
     from camoufox.async_api import AsyncCamoufox
 
-    async with AsyncCamoufox(**_CAMOUFOX_OPTS) as browser:
-        yield browser
+    global _browser_active, _browser_waiting, _browser_launched_total, _browser_failed_total
+
+    semaphore = _get_browser_semaphore()
+    _browser_waiting += 1
+    try:
+        await semaphore.acquire()
+    finally:
+        _browser_waiting = max(0, _browser_waiting - 1)
+    _browser_active += 1
+
+    manager = AsyncCamoufox(**_CAMOUFOX_OPTS)
+    exc_info = (None, None, None)
+    try:
+        try:
+            browser = await manager.__aenter__()
+            _browser_launched_total += 1
+        except Exception:
+            _browser_failed_total += 1
+            raise
+
+        try:
+            yield browser
+        except BaseException:
+            exc_info = sys.exc_info()
+            raise
+        finally:
+            try:
+                await manager.__aexit__(*exc_info)
+            except Exception:
+                _browser_failed_total += 1
+                raise
+    finally:
+        _browser_active = max(0, _browser_active - 1)
+        semaphore.release()
 
 
 async def ensure_browser_installed():

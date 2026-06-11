@@ -88,7 +88,10 @@ class QwenExecutor:
         # 需要 token 反查 email（通过 account_pool）
         if use_prewarmed and self.chat_id_pool is not None and self.account_pool is not None:
             try:
-                acc = next((a for a in self.account_pool.accounts if a.token == token), None)
+                if hasattr(self.account_pool, "get_by_token"):
+                    acc = self.account_pool.get_by_token(token)
+                else:
+                    acc = next((a for a in self.account_pool.accounts if a.token == token), None)
                 if acc is not None:
                     cached = await self.chat_id_pool.acquire(acc.email, model)
                     if cached:
@@ -412,7 +415,7 @@ class QwenExecutor:
                     if "activation" in err_msg or "pending" in err_msg:
                         acc.activation_pending = True
                     if self.auth_resolver is not None:
-                        asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                        self.auth_resolver.schedule_auto_heal(acc)
                 else:
                     exclude.add(acc.email)
 

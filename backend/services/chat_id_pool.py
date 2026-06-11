@@ -19,6 +19,8 @@ import time
 from collections import deque
 from typing import Any, Optional
 
+from backend.core.config import settings
+
 log = logging.getLogger("qwen2api.chat_pool")
 
 
@@ -53,6 +55,7 @@ class ChatIdPool:
         self._refill_task: Optional[asyncio.Task] = None
         self._refilling_emails: set[str] = set()
         self._shutdown = False
+        self._large_pool_suppressed_logged = False
 
     async def _delete_entry(self, account_or_email, chat_id: str, *, source: str) -> None:
         if not chat_id:
@@ -87,6 +90,10 @@ class ChatIdPool:
 
     @property
     def target(self) -> int:
+        return self.effective_target()
+
+    @property
+    def configured_target(self) -> int:
         return self._target
 
     @property
@@ -121,6 +128,25 @@ class ChatIdPool:
             self._ttl,
             self._max_concurrency,
         )
+        self._large_pool_suppressed_logged = False
+
+    def _account_count(self) -> int:
+        """返回当前账号池账号数，无法读取时按 0 处理。"""
+        pool = getattr(self._client, "account_pool", None)
+        return len(getattr(pool, "accounts", []) or []) if pool is not None else 0
+
+    def is_large_pool_prewarm_suppressed(self) -> bool:
+        """判断是否因大账号池保护而暂停预热。"""
+        if getattr(settings, "CHAT_ID_PREWARM_LARGE_POOL_ENABLED", False):
+            return False
+        threshold = max(1, int(getattr(settings, "CHAT_ID_PREWARM_LARGE_POOL_THRESHOLD", 200) or 200))
+        return self._account_count() >= threshold
+
+    def effective_target(self) -> int:
+        """返回考虑大账号池保护后的实际每账号预热目标。"""
+        if self.is_large_pool_prewarm_suppressed():
+            return 0
+        return max(0, int(self._target))
 
     async def apply_config(
         self,
@@ -188,13 +214,14 @@ class ChatIdPool:
             async with self._prewarm_semaphore:
                 chat_id = await self._client.executor.create_chat(token, model, use_prewarmed=False)
             should_delete = False
+            target = self.effective_target()
             async with self._lock:
                 q = self._queues.setdefault(email, deque())
-                if len(q) >= self._target:
+                if len(q) >= target:
                     should_delete = True
                 else:
                     q.append(_Entry(chat_id))
-                    log.info(f"[ChatIdPool] prewarmed email={email} chat_id={chat_id} pool_size={len(q)}")
+                    log.debug(f"[ChatIdPool] prewarmed email={email} chat_id={chat_id} pool_size={len(q)}")
             if should_delete:
                 self._delete_entry_background(account, chat_id, source="chat_pool_overfill")
                 log.debug("[ChatIdPool] discarded overfill email=%s chat_id=%s", email, chat_id)
@@ -205,13 +232,14 @@ class ChatIdPool:
             log.warning(f"[ChatIdPool] prewarm failed email={getattr(account, 'email', '?')}: {err}")
 
     async def _schedule_refill(self, email: str, model: str, *, reason: str) -> None:
-        if self._shutdown or self._target <= 0 or not email:
+        target = self.effective_target()
+        if self._shutdown or target <= 0 or not email:
             return
         async with self._lock:
             if email in self._refilling_emails:
                 return
             q_size = len(self._queues.get(email, []))
-            if q_size >= self._target:
+            if q_size >= target:
                 return
             self._refilling_emails.add(email)
 
@@ -240,11 +268,14 @@ class ChatIdPool:
             return
         if not getattr(account, "token", "") or getattr(account, "status_code", "valid") != "valid":
             return
+        target = self.effective_target()
+        if target <= 0:
+            return
         async with self._lock:
             q_size = len(self._queues.get(email, []))
-            if q_size >= self._target:
+            if q_size >= target:
                 return
-        log.debug("[ChatIdPool] schedule refill email=%s reason=%s pool_size=%s target=%s", email, reason, q_size, self._target)
+        log.debug("[ChatIdPool] schedule refill email=%s reason=%s pool_size=%s target=%s", email, reason, q_size, target)
         await self._prewarm_one(account, model)
 
     async def _refill_loop(self) -> None:
@@ -266,6 +297,18 @@ class ChatIdPool:
             return
         await self.prune_expired()
         all_accounts = getattr(pool, "accounts", []) or []
+        target = self.effective_target()
+        if target <= 0:
+            if self._target > 0 and self.is_large_pool_prewarm_suppressed() and not self._large_pool_suppressed_logged:
+                log.warning(
+                    "[ChatIdPool] large pool prewarm suppressed accounts=%s threshold=%s configured_target=%s",
+                    len(all_accounts),
+                    settings.CHAT_ID_PREWARM_LARGE_POOL_THRESHOLD,
+                    self._target,
+                )
+                self._large_pool_suppressed_logged = True
+            await self.prune_to_target()
+            return
 
         # 只对有 token + 状态 valid 的账号预热
         valid = [a for a in all_accounts if getattr(a, "token", "") and getattr(a, "status_code", "valid") == "valid"]
@@ -285,7 +328,7 @@ class ChatIdPool:
         for acc in valid:
             async with self._lock:
                 q_size = len(self._queues.get(acc.email, []))
-            deficit = self._target - q_size
+            deficit = target - q_size
             # 每轮每账号最多补 1 个，避免突发 API 压力
             if deficit > 0:
                 refill_tasks.append(
@@ -389,7 +432,8 @@ class ChatIdPool:
             q = self._queues.get(email)
             if not q:
                 return 0
-            while len(q) > self._target:
+            target = self.effective_target()
+            while len(q) > target:
                 removed.append(q.pop().chat_id)
         for chat_id in removed:
             await self._delete_entry(email, chat_id, source="chat_pool_prune")
