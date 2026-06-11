@@ -36,8 +36,18 @@ export const FALLBACK_IMAGE_MODELS: ModelOption[] = [
   { id: "qwen3.6-plus-image", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "image", display_name: "qwen3.6-plus image", capabilities: { image_gen: true } },
 ]
 
+export const I2V_COMPAT_VIDEO_MODEL: ModelOption = {
+  id: "qwen-i2v",
+  base_model: "qwen3.7-plus",
+  family: "i2v",
+  mode: "video",
+  display_name: "qwen-i2v",
+  capabilities: { video_gen: true, vision: true },
+}
+
 export const FALLBACK_VIDEO_MODELS: ModelOption[] = [
   { id: "qwen3.6-plus-video", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "video", display_name: "qwen3.6-plus video", capabilities: { video_gen: true } },
+  I2V_COMPAT_VIDEO_MODEL,
 ]
 
 export const CAPABILITY_LABELS: Array<{ key: keyof ModelCapability; label: string }> = [
@@ -173,9 +183,14 @@ export function filterImageModels(options: ModelOption[]): ModelOption[] {
   return capable.length ? capable : FALLBACK_IMAGE_MODELS
 }
 
+function withI2VCompatModel(options: ModelOption[]): ModelOption[] {
+  if (options.some(option => option.id === I2V_COMPAT_VIDEO_MODEL.id)) return options
+  return [...options, I2V_COMPAT_VIDEO_MODEL]
+}
+
 export function filterVideoModels(options: ModelOption[]): ModelOption[] {
   const explicit = options.filter(option => modelMode(option) === "video")
-  if (explicit.length) return explicit
+  if (explicit.length) return withI2VCompatModel(explicit)
   const capable = options
     .filter(option => option.capabilities?.video_gen && !GENERATION_MODES.has(modelMode(option)))
     .map(option => ({
@@ -186,7 +201,7 @@ export function filterVideoModels(options: ModelOption[]): ModelOption[] {
       display_name: `${option.display_name || option.id} video`,
       capabilities: { video_gen: true },
     }))
-  return capable.length ? capable : FALLBACK_VIDEO_MODELS
+  return withI2VCompatModel(capable.length ? capable : FALLBACK_VIDEO_MODELS)
 }
 
 export function chooseDefaultModel(options: ModelOption[], currentModel?: string, preferredId?: string): string {
