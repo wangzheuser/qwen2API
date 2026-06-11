@@ -4,6 +4,12 @@ import sys
 from contextlib import asynccontextmanager
 
 from backend.core.config import settings
+from backend.core.upstream_proxy import (
+    is_proxy_network_error,
+    mark_proxy_failure,
+    resolve_proxy,
+    to_playwright_proxy,
+)
 
 _CAMOUFOX_OPTS = {
     "headless": True,
@@ -54,7 +60,7 @@ def get_browser_metrics() -> dict[str, int]:
 
 
 @asynccontextmanager
-async def _new_browser():
+async def _new_browser(account=None, *, force_proxy_refresh: bool = False, use_proxy: bool = True):
     from camoufox.async_api import AsyncCamoufox
 
     global _browser_active, _browser_waiting, _browser_launched_total, _browser_failed_total
@@ -67,26 +73,39 @@ async def _new_browser():
         _browser_waiting = max(0, _browser_waiting - 1)
     _browser_active += 1
 
-    manager = AsyncCamoufox(**_CAMOUFOX_OPTS)
+    proxy_url = resolve_proxy(account, force_refresh=force_proxy_refresh) if use_proxy else None
+    launch_options = dict(_CAMOUFOX_OPTS)
+    playwright_proxy = to_playwright_proxy(proxy_url)
+    if playwright_proxy:
+        # Camoufox 兼容 Playwright launch proxy 参数。
+        launch_options["proxy"] = playwright_proxy
+
+    manager = AsyncCamoufox(**launch_options)
     exc_info = (None, None, None)
     try:
         try:
             browser = await manager.__aenter__()
             _browser_launched_total += 1
-        except Exception:
+        except Exception as exc:
             _browser_failed_total += 1
+            if proxy_url:
+                mark_proxy_failure(account, proxy_url, exc)
             raise
 
         try:
             yield browser
-        except BaseException:
+        except BaseException as exc:
             exc_info = sys.exc_info()
+            if proxy_url and is_proxy_network_error(exc):
+                mark_proxy_failure(account, proxy_url, exc)
             raise
         finally:
             try:
                 await manager.__aexit__(*exc_info)
             except Exception:
                 _browser_failed_total += 1
+                if proxy_url and is_proxy_network_error(sys.exc_info()[1]):
+                    mark_proxy_failure(account, proxy_url, sys.exc_info()[1])
                 raise
     finally:
         _browser_active = max(0, _browser_active - 1)

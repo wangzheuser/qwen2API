@@ -127,7 +127,7 @@ async def lifespan(app: FastAPI):
         if video_task_runner:
             await video_task_runner.stop()
         # 关闭 HTTP 连接池
-        await app.state.qwen_client._http_client.aclose()
+        await app.state.qwen_client.aclose()
         log.info("HTTP 连接池已关闭")
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)

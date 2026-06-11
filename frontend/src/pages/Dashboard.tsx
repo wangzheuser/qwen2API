@@ -33,6 +33,12 @@ type Status = {
       failed_total?: number
     }
   }
+  upstream_proxy?: {
+    enabled?: boolean
+    template_mode?: boolean
+    bound_accounts?: number
+    failures_total?: number
+  }
   runtime?: { asyncio_running_tasks?: number }
 }
 
@@ -63,6 +69,7 @@ export default function Dashboard() {
   const acc = status?.accounts || {}
   const pool = status?.chat_id_pool
   const browser = status?.browser_automation?.metrics || {}
+  const proxy = status?.upstream_proxy || {}
 
   return (
     <div className="space-y-8 max-w-5xl relative">
@@ -79,9 +86,10 @@ export default function Dashboard() {
         <StatCard icon={<ActivityIcon className="h-5 w-5 text-orange-400" />} title="限流号/失效号" value={`${acc.rate_limited ?? 0} / ${acc.invalid ?? 0}`} accent="orange" />
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2 relative z-10">
+      <div className="grid gap-6 md:grid-cols-3 relative z-10">
         <StatCard icon={<Flame className="h-5 w-5 text-rose-400" />} title="Chat_ID 预热池" value={String(pool?.total_cached ?? 0)} accent="rose" sub={pool ? `实际目标 ${pool.target_per_account} / 配置 ${pool.configured_target_per_account ?? pool.target_per_account} · ${pool.large_pool_suppressed ? "大池已暂停" : `TTL ${Math.round((pool.ttl_seconds || 0) / 60)} 分钟`}` : "未启用"} />
         <StatCard icon={<Database className="h-5 w-5 text-cyan-400" />} title="浏览器实例" value={String(browser.active ?? 0)} accent="cyan" sub={`等待 ${browser.waiting ?? 0} · 上限 ${browser.limit ?? 0} · 失败 ${browser.failed_total ?? 0}`} />
+        <StatCard icon={<Globe className="h-5 w-5 text-blue-400" />} title="上游代理" value={proxy.enabled ? "ON" : "OFF"} accent="blue" sub={`绑定 ${proxy.bound_accounts ?? 0} · 失败 ${proxy.failures_total ?? 0} · ${proxy.template_mode ? "UUID池" : "静态"}`} />
       </div>
 
       <div className="rounded-2xl border border-border/50 bg-card/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">

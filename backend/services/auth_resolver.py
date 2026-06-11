@@ -11,13 +11,16 @@ from typing import Optional
 from backend.core.account_pool import Account, AccountPool
 from backend.core.browser_engine import _new_browser
 from backend.core.config import settings
+from backend.core.upstream_proxy import is_proxy_network_error, mark_proxy_failure, resolve_proxy
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://chat.qwen.ai"
 
-async def _verify_qwen_token(token: str) -> bool:
+async def _verify_qwen_token(token: str, account: Account | None = None) -> bool:
+    """通过 Qwen 官网验证 token，遵循统一上游代理配置。"""
     if not token:
         return False
+    proxy = None
     try:
         import httpx
         headers = {
@@ -29,7 +32,9 @@ async def _verify_qwen_token(token: str) -> bool:
             "Origin": "https://chat.qwen.ai",
             "Connection": "keep-alive"
         }
-        async with httpx.AsyncClient(timeout=15) as client:
+        proxy = resolve_proxy(account)
+        kwargs = {"proxy": proxy} if proxy else {}
+        async with httpx.AsyncClient(timeout=15, **kwargs) as client:
             resp = await client.get(f"{BASE_URL}/api/v1/auths/", headers=headers)
         if resp.status_code != 200:
             return False
@@ -39,7 +44,9 @@ async def _verify_qwen_token(token: str) -> bool:
         except Exception:
             txt = resp.text.lower()
             return 'aliyun_waf' in txt or '<!doctype' in txt
-    except Exception:
+    except Exception as exc:
+        if proxy and is_proxy_network_error(exc):
+            mark_proxy_failure(account, proxy, exc)
         return False
 
 
@@ -103,7 +110,7 @@ async def _extract_verify_link_from_page(page) -> str:
 async def _find_verify_link_via_mail_page(email: str) -> str:
     mail_url = f"{MAIL_BASE}/{email}"
     try:
-        async with _new_browser() as browser:
+        async with _new_browser(use_proxy=False) as browser:
             page = await browser.new_page()
             try:
                 await page.goto(mail_url, wait_until="networkidle", timeout=30000)
@@ -688,7 +695,7 @@ async def activate_account(acc: Account) -> bool:
 
         log.info(f"[激活] {acc.email} 找到验证链接：{verify_link[:120]}")
 
-        async with _new_browser() as browser:
+        async with _new_browser(acc) as browser:
             page = await browser.new_page()
             try:
                 await page.goto(verify_link, wait_until="networkidle", timeout=30000)
@@ -716,7 +723,7 @@ async def activate_account(acc: Account) -> bool:
                 return True
 
             # Some activation links make the original token usable again without issuing a new one.
-            if await _verify_qwen_token(acc.token):
+            if await _verify_qwen_token(acc.token, account=acc):
                 acc.valid = True
                 acc.activation_pending = False
                 log.info(f"[激活] {acc.email} 旧 Token 仍然有效，激活完成")
@@ -828,7 +835,7 @@ class AuthResolver:
 
         log.info(f"[Refresh] 正在打开官网为 {acc.email} 刷新 token...")
         try:
-            async with _new_browser() as browser:
+            async with _new_browser(acc) as browser:
                 page = await browser.new_page()
                 old_token = acc.token or ""
                 new_token = await _login_and_get_token(page, acc.email, acc.password, timeout_sec=30)
@@ -836,7 +843,7 @@ class AuthResolver:
                     log.warning(f"[Refresh] {acc.email} 登录后未获取到 token，URL={page.url}")
                     return False
 
-                if not await _verify_qwen_token(new_token):
+                if not await _verify_qwen_token(new_token, account=acc):
                     log.warning(f"[Refresh] {acc.email} 登录拿到 token，但官网复验未通过，URL={page.url}")
                     return False
 

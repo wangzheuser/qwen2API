@@ -9,6 +9,12 @@ import httpx
 from backend.core.account_pool import AccountPool
 from backend.core.config import settings
 from backend.core.request_trace import trace_context_fields
+from backend.core.upstream_proxy import (
+    clear_proxy_bindings,
+    is_proxy_network_error,
+    mark_proxy_failure,
+    resolve_proxy,
+)
 from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.qwen_executor import QwenExecutor
@@ -25,7 +31,14 @@ class QwenClient:
         self._deleted_chat_ids: set[str] = set()
         self._deleting_chat_ids: dict[str, asyncio.Future[bool]] = {}
         self._delete_lock = asyncio.Lock()
+        self._http_client_lock = asyncio.Lock()
+        self._http_clients: dict[str, httpx.AsyncClient] = {}
 
+        self._http_client = self._create_http_client(None)
+        self._http_clients[""] = self._http_client
+
+    def _create_http_client(self, proxy: str | None) -> httpx.AsyncClient:
+        """创建 Qwen 上游 HTTP 客户端。"""
         # HTTP连接池配置（对齐 ds2api 的高性能设置）
         limits = httpx.Limits(
             max_connections=100,
@@ -34,19 +47,86 @@ class QwenClient:
         )
         # 增加 read timeout 以支持长任务（工具调用可能需要更长时间）
         timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
-        self._http_client = httpx.AsyncClient(
+        kwargs = {"proxy": proxy} if proxy else {}
+        return httpx.AsyncClient(
             limits=limits,
             timeout=timeout,
             http2=True,
             follow_redirects=True,
+            **kwargs,
         )
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self._http_client.aclose()
+        await self.aclose()
         return False
+
+    async def aclose(self) -> None:
+        """关闭所有按代理缓存的 Qwen HTTP 客户端。"""
+        async with self._http_client_lock:
+            clients = list({id(client): client for client in self._http_clients.values()}.values())
+            self._http_clients.clear()
+        for client in clients:
+            await client.aclose()
+
+    async def reset_proxy_runtime(self) -> None:
+        """代理配置热更新后重建 HTTP 客户端并清空运行时绑定。"""
+        await self.aclose()
+        clear_proxy_bindings()
+        async with self._http_client_lock:
+            self._http_client = self._create_http_client(None)
+            self._http_clients[""] = self._http_client
+
+    async def _client_for_proxy(self, proxy: str | None) -> httpx.AsyncClient:
+        """按代理 URL 复用 HTTP 客户端连接池。"""
+        key = proxy or ""
+        async with self._http_client_lock:
+            client = self._http_clients.get(key)
+            if client is None:
+                client = self._create_http_client(proxy)
+                self._http_clients[key] = client
+            return client
+
+    async def _discard_http_client_for_proxy(self, proxy: str | None) -> None:
+        """代理失败后移除对应连接池，避免继续复用坏连接。"""
+        if not proxy:
+            return
+        async with self._http_client_lock:
+            client = self._http_clients.pop(proxy, None)
+        if client is not None:
+            await client.aclose()
+
+    def _account_for_token(self, token: str):
+        """从 token 反查账号；找不到时返回 None 并使用全局代理。"""
+        if not token or self.account_pool is None:
+            return None
+        if hasattr(self.account_pool, "get_by_token"):
+            return self.account_pool.get_by_token(token)
+        return next((a for a in getattr(self.account_pool, "accounts", []) if getattr(a, "token", "") == token), None)
+
+    async def _request_qwen(
+        self,
+        method: str,
+        url: str,
+        *,
+        token: str = "",
+        account=None,
+        force_proxy_refresh: bool = False,
+        **kwargs,
+    ) -> httpx.Response:
+        """统一执行 Qwen HTTP 请求，并按账号选择代理。"""
+        acc = account or self._account_for_token(token)
+        proxy = resolve_proxy(acc, force_refresh=force_proxy_refresh)
+        client = await self._client_for_proxy(proxy)
+        try:
+            return await client.request(method, url, **kwargs)
+        except Exception as exc:
+            if proxy and is_proxy_network_error(exc):
+                mark_proxy_failure(acc, proxy, exc)
+                await self._discard_http_client_for_proxy(proxy)
+            raise
 
     @staticmethod
     def _build_headers(token: str) -> dict[str, str]:
@@ -61,10 +141,24 @@ class QwenClient:
             "Content-Type": "application/json",
         }
 
-    async def _request_json(self, method: str, path: str, token: str, body: dict | None = None, timeout: float = 30.0) -> dict:
-        resp = await self._http_client.request(
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        token: str,
+        body: dict | None = None,
+        timeout: float = 30.0,
+        *,
+        account=None,
+        force_proxy_refresh: bool = False,
+    ) -> dict:
+        """统一 Qwen JSON 请求入口，支持按账号代理绑定。"""
+        resp = await self._request_qwen(
             method,
             f"{BASE_URL}{path}",
+            token=token,
+            account=account,
+            force_proxy_refresh=force_proxy_refresh,
             headers=self._build_headers(token),
             json=body,
             timeout=timeout,
@@ -277,8 +371,10 @@ class QwenClient:
             }
 
         try:
-            resp = await self._http_client.get(
+            resp = await self._request_qwen(
+                "GET",
                 f"{BASE_URL}/api/v1/auths/",
+                token=token,
                 headers=self._build_headers(token),
                 timeout=15.0,
             )
@@ -485,8 +581,10 @@ class QwenClient:
 
     async def list_models(self, token: str) -> list:
         try:
-            resp = await self._http_client.get(
+            resp = await self._request_qwen(
+                "GET",
                 f"{BASE_URL}/api/models",
+                token=token,
                 headers=self._build_headers(token),
                 timeout=10.0,
             )
@@ -586,24 +684,35 @@ class QwenClient:
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict) -> AsyncIterator[dict]:
         # 使用全局连接池，复用连接（对齐 ds2api）
-        async with self._http_client.stream(
-            "POST",
-            f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
-            headers={**self._build_headers(token), "Accept": "text/event-stream"},
-            json=payload,
-        ) as resp:
-            if resp.status_code != 200:
-                yield {"status": resp.status_code, "body": await resp.aread()}
-                return
-            # 使用 aiter_text() 保证 UTF-8 正确处理和 SSE 格式完整
-            async for chunk in resp.aiter_text():
-                if chunk:
-                    yield {"chunk": chunk}
-            yield {"status": "streamed"}
+        acc = self._account_for_token(token)
+        proxy = resolve_proxy(acc)
+        client = await self._client_for_proxy(proxy)
+        try:
+            async with client.stream(
+                "POST",
+                f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+                headers={**self._build_headers(token), "Accept": "text/event-stream"},
+                json=payload,
+            ) as resp:
+                if resp.status_code != 200:
+                    yield {"status": resp.status_code, "body": await resp.aread()}
+                    return
+                # 使用 aiter_text() 保证 UTF-8 正确处理和 SSE 格式完整
+                async for chunk in resp.aiter_text():
+                    if chunk:
+                        yield {"chunk": chunk}
+                yield {"status": "streamed"}
+        except Exception as exc:
+            if proxy and is_proxy_network_error(exc):
+                mark_proxy_failure(acc, proxy, exc)
+                await self._discard_http_client_for_proxy(proxy)
+            raise
 
     async def post_chat_completion_once(self, token: str, chat_id: str, payload: dict, timeout: float = 60.0) -> dict:
-        resp = await self._http_client.post(
+        resp = await self._request_qwen(
+            "POST",
             f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+            token=token,
             headers={**self._build_headers(token), "X-Accel-Buffering": "no"},
             json=payload,
             timeout=timeout,
@@ -611,16 +720,20 @@ class QwenClient:
         return {"status": resp.status_code, "body": resp.text}
 
     async def get_vision_task_status(self, token: str, task_id: str, timeout: float = 30.0) -> dict:
-        resp = await self._http_client.get(
+        resp = await self._request_qwen(
+            "GET",
             f"{BASE_URL}/api/v1/tasks/status/{task_id}",
+            token=token,
             headers=self._build_headers(token),
             timeout=timeout,
         )
         return {"status": resp.status_code, "body": resp.text}
 
     async def get_chat_detail(self, token: str, chat_id: str, timeout: float = 30.0) -> dict:
-        resp = await self._http_client.get(
+        resp = await self._request_qwen(
+            "GET",
             f"{BASE_URL}/api/v2/chats/{chat_id}",
+            token=token,
             headers=self._build_headers(token),
             timeout=timeout,
         )

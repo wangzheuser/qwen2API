@@ -12,6 +12,7 @@ from backend.core.config import (
 )
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool
+from backend.core.upstream_proxy import clear_proxy_bindings, proxy_status
 import secrets
 
 router = APIRouter()
@@ -150,17 +151,19 @@ async def get_system_status(
         running_tasks = -1
 
     from backend.core.browser_engine import get_browser_metrics
+    proxy_stats = proxy_status()
 
     payload = {
         "accounts": pool.status(),
         "chat_id_pool": chat_id_pool_stats,
+        "upstream_proxy": proxy_stats,
         "runtime": {
             "asyncio_running_tasks": running_tasks,
         },
         "request_runtime": {
-            "mode": "direct_http",
+            "mode": "direct_http_with_optional_proxy",
             "browser_required_for_requests": False,
-            "description": "普通请求直连 HTTP，不经过浏览器",
+            "description": "普通请求使用 HTTP 访问 Qwen；启用上游代理时按账号代理绑定，不经过浏览器",
         },
         "browser_automation": {
             "mode": "on_demand_registration_only",
@@ -391,6 +394,14 @@ async def get_settings(request: Request):
         "chat_id_pool_large_pool_enabled": backend_settings.CHAT_ID_PREWARM_LARGE_POOL_ENABLED,
         "auto_heal_on_auth_failure": backend_settings.AUTO_HEAL_ON_AUTH_FAILURE,
         "auto_heal_cooldown_seconds": backend_settings.AUTO_HEAL_COOLDOWN_SECONDS,
+        "qwen_proxy_enabled": backend_settings.QWEN_PROXY_ENABLED,
+        "qwen_upstream_proxy_configured": bool(backend_settings.QWEN_UPSTREAM_PROXY),
+        "qwen_upstream_proxy_masked": proxy_status().get("masked_proxy", ""),
+        "qwen_proxy_template_mode": proxy_status().get("template_mode", False),
+        "qwen_proxy_bound_accounts": proxy_status().get("bound_accounts", 0),
+        "qwen_proxy_failures_total": proxy_status().get("failures_total", 0),
+        "qwen_proxy_pool_bind_per_account": backend_settings.QWEN_PROXY_POOL_BIND_PER_ACCOUNT,
+        "qwen_proxy_failure_cooldown_seconds": backend_settings.QWEN_PROXY_FAILURE_COOLDOWN_SECONDS,
         "keepalive_url": keepalive_config["keepalive_url"],
         "keepalive_interval": keepalive_config["keepalive_interval"],
         "keepalive_env_locked": keepalive_config["env_locked"],
@@ -402,6 +413,7 @@ async def get_settings(request: Request):
 @router.put("/settings", dependencies=[Depends(verify_admin)])
 async def update_settings(data: dict, request: Request):
     from backend.core.config import MODEL_MAP
+    proxy_changed = False
     if "max_inflight_per_account" in data:
         try:
             val = int(data["max_inflight_per_account"])
@@ -434,6 +446,24 @@ async def update_settings(data: dict, request: Request):
             pass
     if "chat_id_pool_large_pool_enabled" in data:
         settings.CHAT_ID_PREWARM_LARGE_POOL_ENABLED = _parse_bool(data.get("chat_id_pool_large_pool_enabled"), False)
+    if "qwen_proxy_enabled" in data:
+        settings.QWEN_PROXY_ENABLED = _parse_bool(data.get("qwen_proxy_enabled"), False)
+        proxy_changed = True
+    if "qwen_upstream_proxy" in data:
+        value = data.get("qwen_upstream_proxy")
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail="Qwen 上游代理必须是字符串")
+        settings.QWEN_UPSTREAM_PROXY = value.strip()
+        proxy_changed = True
+    if "qwen_proxy_pool_bind_per_account" in data:
+        settings.QWEN_PROXY_POOL_BIND_PER_ACCOUNT = _parse_bool(data.get("qwen_proxy_pool_bind_per_account"), True)
+        proxy_changed = True
+    if "qwen_proxy_failure_cooldown_seconds" in data:
+        try:
+            settings.QWEN_PROXY_FAILURE_COOLDOWN_SECONDS = max(0, int(data["qwen_proxy_failure_cooldown_seconds"]))
+            proxy_changed = True
+        except (TypeError, ValueError):
+            pass
     if "global_max_inflight" in data:
         try:
             val = int(data["global_max_inflight"])
@@ -472,6 +502,12 @@ async def update_settings(data: dict, request: Request):
     if "model_aliases" in data:
         MODEL_MAP.clear()
         MODEL_MAP.update(data["model_aliases"])
+    if proxy_changed:
+        client = getattr(request.app.state, "qwen_client", None)
+        if client is not None and hasattr(client, "reset_proxy_runtime"):
+            await client.reset_proxy_runtime()
+        else:
+            clear_proxy_bindings()
     return {"ok": True}
 
 @router.get("/keys", dependencies=[Depends(verify_admin)])
