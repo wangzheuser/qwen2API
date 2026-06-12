@@ -228,7 +228,7 @@ export default function VideoPage() {
   const [loading, setLoading] = useState(false)
   const [videos, setVideos] = useState<GeneratedVideo[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [model, setModel] = useState("qwen3.6-plus-video")
+  const [model, setModel] = useState("qwen3.7-plus-video")
   const [videoModels, setVideoModels] = useState<ModelOption[]>(FALLBACK_VIDEO_MODELS)
   const [generationMode, setGenerationMode] = useState<GenerationMode>("t2v")
   const [firstFrameFile, setFirstFrameFile] = useState<File | null>(null)
@@ -243,7 +243,7 @@ export default function VideoPage() {
 
   const selectedRatio = ASPECT_RATIOS.find(r => r.value === ratio)!
   const sizeStr = `${selectedRatio.w}x${selectedRatio.h}`
-  const groupedModels = groupModelOptions(videoModels)
+  const groupedModels = groupModelOptions(videoModels, { preserveOrder: true })
   const isI2V = generationMode === "i2v"
   const canGenerate = Boolean(prompt.trim()) && !loading && (!isI2V || Boolean(firstFrameFile))
 
@@ -252,7 +252,7 @@ export default function VideoPage() {
       try {
         const options = filterVideoModels(await fetchModelOptions())
         setVideoModels(options)
-        setModel(current => chooseDefaultModel(options, current, "qwen3.6-plus-video"))
+        setModel(current => chooseDefaultModel(options, current, "qwen3.7-plus-video"))
       } catch {
         // keep fallback video model
       }

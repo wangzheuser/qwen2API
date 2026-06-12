@@ -5,6 +5,7 @@
 ## 安全默认值
 
 - 默认不请求线上服务、不读取 API Key、不启动 Claude Code；只打印测试计划。
+- 真实执行默认使用 Claude Code `--safe-mode`，避免加载用户自定义 hooks/MCP，同时保留当前版本可用的内置工具。
 - 真实执行必须显式传入 `--execute`。
 - API Key 只从环境变量读取，默认按顺序读取：`ANTHROPIC_API_KEY`、`QWEN2API_API_KEY`。
 - 所有测试文件、日志和结果默认写入 `/tmp/qwen2api-claude-tool-matrix-*`。
@@ -54,3 +55,30 @@ python3 tools/claude_tool_matrix.py \
 - `FAIL`：未调用工具、参数错误、执行失败或副作用不正确。
 - `UNSTABLE`：重试后状态或失败原因不一致。
 - `SKIP`：模型或场景不适合本轮工具调用测试。
+
+## 隔离模式
+
+- `--isolation-mode safe`：默认值，保留内置工具，禁用自定义项。
+- `--isolation-mode bare`：最小模式；当前 Claude Code 2.1.170 仅暴露 `Bash/Edit/Read`，不适合测试 Write/WebFetch 等工具。
+- `--isolation-mode normal`：加载完整本机配置，适合排查真实工作环境，但结果可能受 hooks、插件和 MCP 影响。
+
+脚本会读取 Claude Code 初始化事件中的 `tools` 字段；如果目标工具未暴露，该场景会标记为 `SKIP`，不会误判为模型失败，也不会阻断后续 P1 可用工具测试。
+
+## 备注
+
+Claude Code 的 `Edit` 工具要求目标文件先进入上下文，因此脚本的 Edit 场景会显式执行 `Read -> Edit`，避免把客户端安全约束误判为模型工具能力失败。
+
+## 快速全模型核心链路
+
+如果需要先快速判断哪些模型具备核心工具链能力，可只跑 `CoreChain`：
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+python3 tools/claude_tool_matrix.py \
+  --execute \
+  --api-base https://qwen2api.codeai.de5.net \
+  --tests CoreChain \
+  --verbose
+```
+
+`CoreChain` 会在一个会话中验证 `Read -> Edit -> Write -> Bash`。
