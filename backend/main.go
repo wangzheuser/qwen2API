@@ -7703,10 +7703,66 @@ func shouldForceToolContinuation(req StandardRequest, result CompletionResult) b
 	if text == "" {
 		return true
 	}
+	if isGroundedFinalTextFromLatestToolResult(req, result) {
+		return false
+	}
 	if isLikelyCompletedToolTurn(text) {
 		return shouldRejectUngroundedFinalClaim(req, result)
 	}
 	return isLikelyNarrationOnlyToolTurn(text)
+}
+
+// isGroundedFinalTextFromLatestToolResult allows concise final answers that are
+// directly supported by the latest client tool result, such as a Bash marker.
+func isGroundedFinalTextFromLatestToolResult(req StandardRequest, result CompletionResult) bool {
+	text := strings.TrimSpace(toolParseText(result))
+	if text == "" {
+		return false
+	}
+	latest := latestToolResultText(req.Prompt)
+	if latest == "" || !toolResultSupportsFinalText(latest, text) {
+		return false
+	}
+	return !shouldRejectUngroundedFinalClaim(req, result)
+}
+
+// latestToolResultText extracts the newest rendered [Tool Result] block from
+// the prompt produced for the QNML tool bridge.
+func latestToolResultText(prompt string) string {
+	start := strings.LastIndex(prompt, "[Tool Result")
+	if start < 0 {
+		return ""
+	}
+	afterStart := prompt[start:]
+	lineEnd := strings.Index(afterStart, "\n")
+	if lineEnd < 0 {
+		return ""
+	}
+	contentStart := start + lineEnd + 1
+	afterContent := prompt[contentStart:]
+	end := strings.Index(afterContent, "[/Tool Result]")
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(afterContent[:end])
+}
+
+// toolResultSupportsFinalText checks only direct textual grounding. This keeps
+// recovery active for generic narration while accepting exact tool output.
+func toolResultSupportsFinalText(toolResult, finalText string) bool {
+	result := normalizeToolResultText(toolResult)
+	final := normalizeToolResultText(finalText)
+	if result == "" || final == "" {
+		return false
+	}
+	return strings.Contains(result, final) || strings.Contains(final, result)
+}
+
+// normalizeToolResultText makes containment checks insensitive to whitespace
+// and common quote wrappers without changing the semantic text.
+func normalizeToolResultText(text string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	return strings.Trim(normalized, "`'\"“”‘’")
 }
 
 func shouldRecoverMissingInitialToolCall(req StandardRequest, result CompletionResult) bool {
