@@ -21,7 +21,7 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 	}
 	ts := time.Now().Unix()
 	isImage := chatType == "image_gen" || chatType == "t2i"
-	isVideo := chatType == "t2v"
+	isVideo := chatType == "t2v" || chatType == "i2v"
 	featureConfig := map[string]any{}
 	messageChatType := chatType
 	subChatType := chatType
@@ -40,15 +40,26 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 		messageMeta = map[string]any{"subChatType": "t2i", "mode": "image_generation", "aspectRatio": ratio, "size": ratio}
 	} else if isVideo {
 		ratio := imageRatio(imageOptions)
-		featureConfig = map[string]any{
-			"thinking_enabled": false, "output_schema": "phase", "auto_thinking": false,
-			"thinking_mode": "off", "auto_search": false, "code_interpreter": false,
-			"function_calling": false, "plugins_enabled": true, "video_generation": true,
-			"default_aspect_ratio": ratio,
+		if chatType == "i2v" {
+			// I2V 使用 Qwen Web 抓包中的轻量配置，首帧通过 files 字段传入。
+			featureConfig = map[string]any{
+				"thinking_enabled": false, "output_schema": "phase", "research_mode": "normal",
+				"auto_thinking": false, "thinking_mode": "Fast", "auto_search": true,
+			}
+			messageChatType = "i2v"
+			subChatType = "i2v"
+			messageMeta = map[string]any{"subChatType": "i2v", "size": ratio}
+		} else {
+			featureConfig = map[string]any{
+				"thinking_enabled": false, "output_schema": "phase", "auto_thinking": false,
+				"thinking_mode": "off", "auto_search": false, "code_interpreter": false,
+				"function_calling": false, "plugins_enabled": true, "video_generation": true,
+				"default_aspect_ratio": ratio,
+			}
+			messageChatType = "t2v"
+			subChatType = "t2v"
+			messageMeta = map[string]any{"subChatType": "t2v", "mode": "video_generation", "aspectRatio": ratio, "size": ratio}
 		}
-		messageChatType = "t2v"
-		subChatType = "t2v"
-		messageMeta = map[string]any{"subChatType": "t2v", "mode": "video_generation", "aspectRatio": ratio, "size": ratio}
 	} else {
 		thinking := true
 		autoThinking := true

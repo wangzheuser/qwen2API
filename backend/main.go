@@ -64,6 +64,8 @@ type App struct {
 	sessionStore      *JSONStore
 	fileContentCache  *fileContentCache
 	keepalive         *KeepAliveService
+	videoTasks        map[string]*VideoTask
+	videoTasksMu      sync.RWMutex
 }
 
 func main() {
@@ -159,6 +161,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 		uploadedFileStore: NewJSONStore(settings.UploadedFilesFile, []any{}),
 		sessionStore:      NewJSONStore(settings.ContextAffinityFile, []any{}),
 		fileContentCache:  newFileContentCache(),
+		videoTasks:        map[string]*VideoTask{},
 	}
 
 	app.apiKeys, app.managedAPIKeys, app.envAPIKeys = loadAPIKeys(settings.APIKeysFile, logger)
@@ -2403,6 +2406,8 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /images/generations", app.handleImages)
 	mux.HandleFunc("POST /v1/videos/generations", app.handleVideos)
 	mux.HandleFunc("POST /videos/generations", app.handleVideos)
+	mux.HandleFunc("GET /v1/videos/tasks/{task_id}", app.handleVideoTask)
+	mux.HandleFunc("GET /videos/tasks/{task_id}", app.handleVideoTask)
 	mux.HandleFunc("POST /v1/files", app.handleUploadFile)
 	mux.HandleFunc("POST /api/files/upload", app.handleUploadFile)
 	mux.HandleFunc("DELETE /v1/files/{file_id}", app.handleDeleteFile)
@@ -5903,8 +5908,213 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 	return nil, fmt.Errorf("All %d attempts failed. Last error: %w", attempts, lastErr)
 }
 
+const (
+	videoTaskTTLSeconds     = 24 * 60 * 60
+	videoFirstFrameMaxBytes = 20 * 1024 * 1024
+	videoTaskObjectType     = "video.generation.task"
+	defaultT2VModel         = "qwen3.6-plus"
+	defaultI2VModel         = "qwen3.7-plus"
+)
+
+// VideoTask 是单进程内存中的视频生成任务快照。
+type VideoTask struct {
+	ID        string         `json:"id"`
+	Object    string         `json:"object"`
+	OwnerHash string         `json:"owner_hash"`
+	Status    string         `json:"status"`
+	Request   map[string]any `json:"request"`
+	Result    map[string]any `json:"result,omitempty"`
+	Error     map[string]any `json:"error,omitempty"`
+	Mode      string         `json:"mode"`
+	Model     string         `json:"model"`
+	Created   int64          `json:"created"`
+	Updated   int64          `json:"updated"`
+	Started   int64          `json:"started,omitempty"`
+	Finished  int64          `json:"finished,omitempty"`
+	Expires   int64          `json:"expires"`
+}
+
+// hashVideoTaskOwner 只保存调用方哈希，避免在任务查询索引中暴露客户端 API Key。
+func hashVideoTaskOwner(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// copyMapAny 返回浅拷贝，防止任务快照被调用方意外修改。
+func copyMapAny(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+// videoTaskResponse 把内部任务状态转换为 OpenAI 风格的任务查询响应。
+func videoTaskResponse(task *VideoTask) map[string]any {
+	if task == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{
+		"id":       task.ID,
+		"object":   task.Object,
+		"status":   task.Status,
+		"model":    task.Model,
+		"mode":     task.Mode,
+		"created":  task.Created,
+		"updated":  task.Updated,
+		"expires":  task.Expires,
+		"poll_url": "/v1/videos/tasks/" + task.ID,
+	}
+	if task.Started > 0 {
+		out["started"] = task.Started
+	}
+	if task.Finished > 0 {
+		out["finished"] = task.Finished
+	}
+	for key, value := range task.Result {
+		out[key] = value
+	}
+	if task.Error != nil {
+		out["error"] = task.Error
+		out["detail"] = task.Error["message"]
+	}
+	return out
+}
+
+// createVideoTask 创建内存任务并记录原始生成参数。
+func (app *App) createVideoTask(ownerHash string, requestData map[string]any) *VideoTask {
+	now := time.Now().Unix()
+	task := &VideoTask{
+		ID:        "video_task_" + randomID(),
+		Object:    videoTaskObjectType,
+		OwnerHash: ownerHash,
+		Status:    "queued",
+		Request:   copyMapAny(requestData),
+		Mode:      stringValue(requestData, "generation_chat_type", "t2v"),
+		Model:     stringValue(requestData, "model", ""),
+		Created:   now,
+		Updated:   now,
+		Expires:   now + videoTaskTTLSeconds,
+	}
+	app.videoTasksMu.Lock()
+	app.videoTasks[task.ID] = task
+	app.videoTasksMu.Unlock()
+	return task
+}
+
+// getVideoTask 按任务归属返回任务快照，避免跨 API Key 查询。
+func (app *App) getVideoTask(taskID, ownerHash string) (*VideoTask, bool) {
+	app.videoTasksMu.RLock()
+	defer app.videoTasksMu.RUnlock()
+	task, ok := app.videoTasks[taskID]
+	if !ok || task == nil {
+		return nil, false
+	}
+	if task.OwnerHash != "" && ownerHash != "" && task.OwnerHash != ownerHash {
+		return nil, false
+	}
+	cp := *task
+	cp.Request = copyMapAny(task.Request)
+	cp.Result = copyMapAny(task.Result)
+	cp.Error = copyMapAny(task.Error)
+	return &cp, true
+}
+
+// updateVideoTask 在锁内更新任务状态，统一维护更新时间。
+func (app *App) updateVideoTask(taskID string, mutate func(task *VideoTask)) {
+	app.videoTasksMu.Lock()
+	defer app.videoTasksMu.Unlock()
+	task := app.videoTasks[taskID]
+	if task == nil {
+		return
+	}
+	mutate(task)
+	task.Updated = time.Now().Unix()
+}
+
+// runVideoTask 在后台执行视频生成，并把终态写回任务表。
+func (app *App) runVideoTask(taskID string) {
+	app.updateVideoTask(taskID, func(task *VideoTask) {
+		if task.Status == "queued" {
+			task.Status = "running"
+			task.Started = time.Now().Unix()
+		}
+	})
+	task, ok := app.getVideoTask(taskID, "")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+	result, err := app.generateVideoData(ctx, task.Request)
+	if err != nil {
+		app.updateVideoTask(taskID, func(task *VideoTask) {
+			task.Status = "failed"
+			task.Error = map[string]any{"code": "video_generation_failed", "message": sanitizeVideoTaskError(err)}
+			task.Finished = time.Now().Unix()
+		})
+		app.logWarn(ctx, "异步视频任务失败", "task_id", taskID, "error", err)
+		return
+	}
+	app.updateVideoTask(taskID, func(task *VideoTask) {
+		task.Status = "succeeded"
+		task.Result = result
+		task.Error = nil
+		task.Finished = time.Now().Unix()
+	})
+	app.logInfo(ctx, "异步视频任务完成", "task_id", taskID)
+}
+
+// sanitizeVideoTaskError 脱敏错误中的签名 URL 查询串，避免任务响应泄露临时凭证。
+func sanitizeVideoTaskError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	text := err.Error()
+	re := regexp.MustCompile(`https?://[^\s"'<>]+`)
+	text = re.ReplaceAllStringFunc(text, func(raw string) string {
+		if idx := strings.Index(raw, "?"); idx >= 0 {
+			return raw[:idx]
+		}
+		return raw
+	})
+	return truncate(text, 500)
+}
+
+// handleVideoTask 查询异步视频任务状态和最终生成结果。
+func (app *App) handleVideoTask(w http.ResponseWriter, r *http.Request) {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
+		return
+	}
+	taskID := strings.TrimSpace(r.PathValue("task_id"))
+	if taskID == "" {
+		writeError(w, http.StatusBadRequest, "task_id is required")
+		return
+	}
+	task, found := app.getVideoTask(taskID, hashVideoTaskOwner(auth.Token))
+	if !found {
+		writeError(w, http.StatusNotFound, "Video task not found")
+		return
+	}
+	if task.Expires > 0 && time.Now().Unix() > task.Expires && (task.Status == "queued" || task.Status == "running") {
+		app.updateVideoTask(taskID, func(task *VideoTask) {
+			task.Status = "expired"
+			task.Error = map[string]any{"code": "expired", "message": "Video task expired"}
+			task.Finished = time.Now().Unix()
+		})
+		task, _ = app.getVideoTask(taskID, hashVideoTaskOwner(auth.Token))
+	}
+	writeJSON(w, http.StatusOK, videoTaskResponse(task))
+}
+
+// handleVideos 兼容 OpenAI 风格视频生成，并支持同步、异步、T2V、I2V 四种入口。
 func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -5921,15 +6131,70 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 	size, ratio := normalizeMediaSize(firstStringAny(body["size"], body["ratio"], body["aspect_ratio"]))
 	width, height := mediaDimensions(size)
 	duration := min(max(1, intValue(body, "duration", 5)), 10)
-	model := resolveMediaModel(stringValue(body, "model", ""), false)
+	firstFrameFileID := firstVideoFrameFileID(body)
+	generationChatType := "t2v"
+	// 上传首帧或显式 I2V 别名都会进入 Qwen 的 i2v chat_type。
+	if firstFrameFileID != "" || isI2VModelAlias(stringValue(body, "model", "")) {
+		generationChatType = "i2v"
+	}
+	if generationChatType == "i2v" && firstFrameFileID == "" {
+		writeError(w, http.StatusBadRequest, "file_id is required for image-to-video generation")
+		return
+	}
+	if firstFrameFileID != "" {
+		if err := app.validateFirstFrameFile(firstFrameFileID, auth.Token); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	model := resolveVideoMediaModel(stringValue(body, "model", ""), generationChatType)
 	setRequestLogFields(r.Context(), "surface", "videos", "requested_model", stringValue(body, "model", ""), "resolved_model", model, "stream", "false", "tool_enabled", "false", "prompt_len", len(prompt))
-	app.logInfo(r.Context(), "视频生成请求解析完成", "size", size, "ratio", ratio, "width", width, "height", height, "duration", duration, "n", n)
-	promptText := fmt.Sprintf("%s\n\n视频要求：生成 %d 秒视频，宽高比 %s，参考画面尺寸 %s。", prompt, duration, ratio, size)
-	urls, lastErr := app.createVideoURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height, "duration": duration})
+	app.logInfo(r.Context(), "视频生成请求解析完成", "size", size, "ratio", ratio, "width", width, "height", height, "duration", duration, "n", n, "chat_type", generationChatType)
+
+	requestData := map[string]any{
+		"prompt": prompt, "model": model, "requested_model": stringValue(body, "model", ""),
+		"n": n, "size": size, "ratio": ratio, "width": width, "height": height,
+		"duration": duration, "generation_chat_type": generationChatType,
+		"first_frame_file_id": firstFrameFileID, "owner_token": auth.Token,
+	}
+	if b := coerceBool(body["async"]); b != nil && *b {
+		// 异步分支立即返回任务 ID，后台 goroutine 继续复用同一生成逻辑。
+		task := app.createVideoTask(hashVideoTaskOwner(auth.Token), requestData)
+		go app.runVideoTask(task.ID)
+		writeJSON(w, http.StatusAccepted, videoTaskResponse(task))
+		return
+	}
+
+	result, lastErr := app.generateVideoData(r.Context(), requestData)
 	if lastErr != nil {
 		app.logWarn(r.Context(), "视频生成失败", "error", lastErr)
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// generateVideoData 复用同步生成逻辑，返回任务和普通接口共同使用的 data[] 结构。
+func (app *App) generateVideoData(ctx context.Context, requestData map[string]any) (map[string]any, error) {
+	prompt := stringValue(requestData, "prompt", "")
+	model := stringValue(requestData, "model", "")
+	n := min(max(1, intValue(requestData, "n", 1)), 2)
+	size := stringValue(requestData, "size", "1664x928")
+	ratio := stringValue(requestData, "ratio", "16:9")
+	width := intValue(requestData, "width", 1664)
+	height := intValue(requestData, "height", 928)
+	duration := min(max(1, intValue(requestData, "duration", 5)), 10)
+	generationChatType := stringValue(requestData, "generation_chat_type", "t2v")
+	ownerToken := stringValue(requestData, "owner_token", "")
+	firstFrameFileID := stringValue(requestData, "first_frame_file_id", "")
+	promptText := fmt.Sprintf("%s\n\n视频要求：生成 %d 秒视频，宽高比 %s，参考画面尺寸 %s。", prompt, duration, ratio, size)
+	options := map[string]any{"size": size, "ratio": ratio, "width": width, "height": height, "duration": duration}
+	if firstFrameFileID != "" {
+		options["file_id"] = firstFrameFileID
+	}
+	urls, err := app.createVideoURLs(ctx, model, promptText, options, generationChatType, ownerToken)
+	if err != nil {
+		return nil, err
 	}
 	data := []map[string]any{}
 	for i, url := range urls {
@@ -5939,16 +6204,83 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 		data = append(data, map[string]any{"url": url, "revised_prompt": prompt, "size": size, "ratio": ratio, "width": width, "height": height, "duration": duration})
 	}
 	if len(data) == 0 {
-		app.logWarn(r.Context(), "视频生成未识别到视频链接")
-		writeError(w, http.StatusInternalServerError, "Video generation produced no video URL")
-		return
+		app.logWarn(ctx, "视频生成未识别到视频链接")
+		return nil, fmt.Errorf("Video generation produced no video URL")
 	}
-	app.logInfo(r.Context(), "视频生成完成", "returned", len(data))
-	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+	app.logInfo(ctx, "视频生成完成", "returned", len(data), "chat_type", generationChatType)
+	return map[string]any{"created": time.Now().Unix(), "data": data}, nil
 }
 
-func (app *App) createVideoURLs(ctx context.Context, model, promptText string, videoOptions map[string]any) ([]string, error) {
+// firstVideoFrameFileID 从兼容字段中提取首帧 file_id。
+func firstVideoFrameFileID(body map[string]any) string {
+	if fileID := strings.TrimSpace(stringValue(body, "file_id", "")); fileID != "" {
+		return fileID
+	}
+	if frame, ok := body["first_frame"].(map[string]any); ok {
+		return strings.TrimSpace(anyString(frame["file_id"], ""))
+	}
+	return ""
+}
+
+// isI2VModelAlias 判断是否为图生视频兼容别名。
+func isI2VModelAlias(model string) bool {
+	switch normalizeLower(model) {
+	case "qwen-i2v", "qwen-image-to-video", "qwen-video-i2v", "qwen3.7-plus-i2v":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveVideoMediaModel 根据生成模式解析视频模型别名。
+func resolveVideoMediaModel(requested, chatType string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		if chatType == "i2v" {
+			return defaultI2VModel
+		}
+		return defaultT2VModel
+	}
+	aliases := map[string]string{
+		"qwen-video": "qwen3.6-plus", "qwen-video-plus": "qwen3.6-plus", "qwen-video-turbo": "qwen3.6-plus",
+		"sora": "qwen3.6-plus", "sora-2": "qwen3.6-plus",
+		"qwen-i2v": defaultI2VModel, "qwen-image-to-video": defaultI2VModel,
+		"qwen-video-i2v": defaultI2VModel, "qwen3.7-plus-i2v": defaultI2VModel,
+	}
+	if v, ok := aliases[strings.ToLower(requested)]; ok {
+		return v
+	}
+	mode := parseModelMode(requested, defaultT2VModel)
+	return resolveModel(mode.BaseModel)
+}
+
+// validateFirstFrameFile 校验本地首帧文件归属、大小和 MIME。
+func (app *App) validateFirstFrameFile(fileID, ownerToken string) error {
+	record, err := app.getUploadedLocalFile(fileID, ownerToken)
+	if err != nil {
+		return err
+	}
+	if record == nil {
+		return fmt.Errorf("first frame file_id not found")
+	}
+	if record.Size <= 0 {
+		return fmt.Errorf("first frame image is empty")
+	}
+	if record.Size > videoFirstFrameMaxBytes {
+		return fmt.Errorf("first frame image exceeds %d bytes", videoFirstFrameMaxBytes)
+	}
+	if !strings.HasPrefix(strings.ToLower(record.ContentType), "image/") {
+		return fmt.Errorf("first frame must be an image MIME type, got %s", firstNonEmpty(record.ContentType, "unknown"))
+	}
+	return nil
+}
+
+// createVideoURLs 调用 Qwen 生成视频，I2V 模式会先把本地首帧上传到上游。
+func (app *App) createVideoURLs(ctx context.Context, model, promptText string, videoOptions map[string]any, generationChatType, ownerToken string) ([]string, error) {
 	var lastErr error
+	if generationChatType == "" {
+		generationChatType = "t2v"
+	}
 	attempts := app.mediaRetryAttempts()
 	for attempt := 0; attempt < attempts; attempt++ {
 		acc, err := app.accounts.AcquireFor(ctx, "", accountUsageVideo)
@@ -5960,8 +6292,8 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 		func() {
 			defer app.accounts.Release(acc)
 			setRequestLogFields(ctx, "account", acc.Email)
-			app.logInfo(ctx, "视频生成开始尝试", "attempt", attempt+1, "model", model)
-			chatID, err = app.client.CreateChat(ctx, acc.Token, model, "t2v")
+			app.logInfo(ctx, "视频生成开始尝试", "attempt", attempt+1, "model", model, "chat_type", generationChatType)
+			chatID, err = app.client.CreateChat(ctx, acc.Token, model, generationChatType)
 			if err != nil {
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
@@ -5971,7 +6303,33 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, nil, "t2v", videoOptions, nil, false)
+			files := []map[string]any{}
+			if generationChatType == "i2v" {
+				// 首帧只在选定上游账号后上传，确保上传 token 与后续生成会话一致。
+				record, err := app.getUploadedLocalFile(stringValue(videoOptions, "file_id", ""), ownerToken)
+				if err != nil {
+					lastErr = err
+					app.logWarn(ctx, "视频生成首帧读取失败", "attempt", attempt+1, "error", err)
+					return
+				}
+				if record == nil {
+					lastErr = fmt.Errorf("first frame file_id not found")
+					app.logWarn(ctx, "视频生成首帧不存在", "attempt", attempt+1)
+					return
+				}
+				uploaded, err := app.uploadLocalFileToUpstream(ctx, acc, *record)
+				if err != nil {
+					lastErr = err
+					app.classifyAccountErrorFor(acc, err, accountUsageVideo)
+					app.logWarn(ctx, "视频生成首帧上传失败", "attempt", attempt+1, "error", err)
+					return
+				}
+				if ref, ok := uploaded["remote_ref"].(map[string]any); ok {
+					files = append(files, ref)
+				}
+			}
+
+			payload := buildChatPayload(chatID, model, promptText, false, files, generationChatType, videoOptions, nil, false)
 			payload["stream"] = false
 			status, body, err := app.client.PostChatCompletionOnce(ctx, acc.Token, chatID, payload, 90*time.Second)
 			if err != nil {
