@@ -33,6 +33,8 @@ export const FALLBACK_CHAT_MODELS: ModelOption[] = [
 ]
 
 export const FALLBACK_IMAGE_MODELS: ModelOption[] = [
+  { id: "qwen3.7-max-image", base_model: "qwen3.7-max", family: "qwen3.7", mode: "image", display_name: "qwen3.7-max image", capabilities: { image_gen: true } },
+  { id: "qwen3.7-plus-image", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "image", display_name: "qwen3.7-plus image", capabilities: { image_gen: true } },
   { id: "qwen3.6-plus-image", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "image", display_name: "qwen3.6-plus image", capabilities: { image_gen: true } },
 ]
 
@@ -46,8 +48,10 @@ export const I2V_COMPAT_VIDEO_MODEL: ModelOption = {
 }
 
 export const FALLBACK_VIDEO_MODELS: ModelOption[] = [
-  { id: "qwen3.6-plus-video", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "video", display_name: "qwen3.6-plus video", capabilities: { video_gen: true } },
+  { id: "qwen3.7-max-video", base_model: "qwen3.7-max", family: "qwen3.7", mode: "video", display_name: "qwen3.7-max video", capabilities: { video_gen: true } },
+  { id: "qwen3.7-plus-video", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "video", display_name: "qwen3.7-plus video", capabilities: { video_gen: true } },
   I2V_COMPAT_VIDEO_MODEL,
+  { id: "qwen3.6-plus-video", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "video", display_name: "qwen3.6-plus video", capabilities: { video_gen: true } },
 ]
 
 export const CAPABILITY_LABELS: Array<{ key: keyof ModelCapability; label: string }> = [
@@ -64,6 +68,25 @@ export const CAPABILITY_LABELS: Array<{ key: keyof ModelCapability; label: strin
 const MODEL_MODE_SUFFIX_RE = /-(thinking|search|deep-research|deep_research|image|video|webdev|web-dev|slides|t2i|t2v)$/i
 const TEXT_TEST_MODES = new Set(["chat", "thinking", "search", "deep_research"])
 const GENERATION_MODES = new Set(["image", "video", "webdev", "slides"])
+const IMAGE_MODEL_PRIORITY = [
+  "qwen3.7-max-image",
+  "qwen3.7-plus-image",
+  "qwen3.6-plus-image",
+  "qwen3-max-2026-01-23-image",
+  "qwen3.6-35b-a3b-image",
+  "qwen3.5-plus-image",
+]
+const VIDEO_MODEL_PRIORITY = [
+  "qwen3.7-max-video",
+  "qwen3.7-plus-video",
+  "qwen-i2v",
+  "qwen3.6-plus-video",
+  "qwen3-max-2026-01-23-video",
+  "qwen3.6-35b-a3b-video",
+  "qwen3.5-plus-video",
+]
+const IMAGE_MODEL_PRIORITY_INDEX = new Map(IMAGE_MODEL_PRIORITY.map((id, index) => [id, index]))
+const VIDEO_MODEL_PRIORITY_INDEX = new Map(VIDEO_MODEL_PRIORITY.map((id, index) => [id, index]))
 const MODE_NAME_SUFFIX: Record<string, string> = {
   thinking: "thinking",
   search: "search",
@@ -106,6 +129,65 @@ function familyOf(option: ModelOption): string {
     if (parts.length >= 2) return parts.slice(0, 2).join(".")
   }
   return base.split("-", 1)[0] || "Qwen"
+}
+
+/**
+ * 拼接可用于模型代际和规格判断的稳定文本。
+ */
+function modelSearchText(option: ModelOption): string {
+  return [option.id, option.base_model, option.family, option.display_name]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+}
+
+/**
+ * 计算模型代际分数，分数越低优先级越高。
+ */
+function generationScore(text: string): number {
+  if (text.includes("qwen3.7")) return 0
+  if (text.includes("qwen3.6")) return 100
+  if (text.includes("qwen3.5")) return 200
+  if (text.includes("qwen3")) return 300
+  if (text.includes("qwen")) return 400
+  return 500
+}
+
+/**
+ * 计算模型规格分数，分数越低质量上限越高。
+ */
+function tierScore(text: string): number {
+  if (text.includes("max")) return 0
+  if (text.includes("plus")) return 10
+  if (text.includes("397b")) return 20
+  if (text.includes("235b")) return 25
+  if (text.includes("122b")) return 30
+  if (text.includes("35b")) return 40
+  if (text.includes("27b")) return 50
+  if (text.includes("mini")) return 80
+  if (text.includes("flash")) return 90
+  return 70
+}
+
+/**
+ * 按生成质量优先级排序模型，未显式配置的模型使用稳定兜底规则。
+ */
+function sortGenerationModels(options: ModelOption[], kind: "image" | "video"): ModelOption[] {
+  const priorityIndex = kind === "image" ? IMAGE_MODEL_PRIORITY_INDEX : VIDEO_MODEL_PRIORITY_INDEX
+  return [...options].sort((a, b) => {
+    const explicitA = priorityIndex.get(a.id.toLowerCase())
+    const explicitB = priorityIndex.get(b.id.toLowerCase())
+    if (explicitA !== undefined || explicitB !== undefined) {
+      return (explicitA ?? Number.MAX_SAFE_INTEGER) - (explicitB ?? Number.MAX_SAFE_INTEGER)
+    }
+
+    const textA = modelSearchText(a)
+    const textB = modelSearchText(b)
+    const scoreA = generationScore(textA) + tierScore(textA)
+    const scoreB = generationScore(textB) + tierScore(textB)
+    if (scoreA !== scoreB) return scoreA - scoreB
+    return a.id.localeCompare(b.id)
+  })
 }
 
 export function normalizeModelOption(value: unknown): ModelOption | null {
@@ -169,7 +251,7 @@ export function filterTextTestModels(options: ModelOption[]): ModelOption[] {
 
 export function filterImageModels(options: ModelOption[]): ModelOption[] {
   const explicit = options.filter(option => modelMode(option) === "image")
-  if (explicit.length) return explicit
+  if (explicit.length) return sortGenerationModels(explicit, "image")
   const capable = options
     .filter(option => option.capabilities?.image_gen && !GENERATION_MODES.has(modelMode(option)))
     .map(option => ({
@@ -180,7 +262,7 @@ export function filterImageModels(options: ModelOption[]): ModelOption[] {
       display_name: `${option.display_name || option.id} image`,
       capabilities: { image_gen: true },
     }))
-  return capable.length ? capable : FALLBACK_IMAGE_MODELS
+  return sortGenerationModels(capable.length ? capable : FALLBACK_IMAGE_MODELS, "image")
 }
 
 function withI2VCompatModel(options: ModelOption[]): ModelOption[] {
@@ -190,7 +272,7 @@ function withI2VCompatModel(options: ModelOption[]): ModelOption[] {
 
 export function filterVideoModels(options: ModelOption[]): ModelOption[] {
   const explicit = options.filter(option => modelMode(option) === "video")
-  if (explicit.length) return withI2VCompatModel(explicit)
+  if (explicit.length) return sortGenerationModels(withI2VCompatModel(explicit), "video")
   const capable = options
     .filter(option => option.capabilities?.video_gen && !GENERATION_MODES.has(modelMode(option)))
     .map(option => ({
@@ -201,7 +283,7 @@ export function filterVideoModels(options: ModelOption[]): ModelOption[] {
       display_name: `${option.display_name || option.id} video`,
       capabilities: { video_gen: true },
     }))
-  return withI2VCompatModel(capable.length ? capable : FALLBACK_VIDEO_MODELS)
+  return sortGenerationModels(withI2VCompatModel(capable.length ? capable : FALLBACK_VIDEO_MODELS), "video")
 }
 
 export function chooseDefaultModel(options: ModelOption[], currentModel?: string, preferredId?: string): string {
@@ -211,7 +293,24 @@ export function chooseDefaultModel(options: ModelOption[], currentModel?: string
   return base?.id || options[0]?.id || preferredId || "qwen3.6-plus"
 }
 
-export function groupModelOptions(options: ModelOption[]): ModelGroup[] {
+/**
+ * 按模型家族分组；保序模式使用连续分组，避免 optgroup 改变能力排序。
+ */
+export function groupModelOptions(options: ModelOption[], config: { preserveOrder?: boolean } = {}): ModelGroup[] {
+  if (config.preserveOrder) {
+    return options.reduce<ModelGroup[]>((groups, option) => {
+      const family = familyOf(option)
+      const lastGroup = groups[groups.length - 1]
+      // 相邻同家族合并，跨家族不回填，保证下拉顺序与排序结果一致。
+      if (lastGroup?.family === family) {
+        lastGroup.models.push(option)
+      } else {
+        groups.push({ family, models: [option] })
+      }
+      return groups
+    }, [])
+  }
+
   const groups = new Map<string, ModelOption[]>()
   options.forEach(option => {
     const family = familyOf(option)
@@ -221,7 +320,7 @@ export function groupModelOptions(options: ModelOption[]): ModelGroup[] {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([family, models]) => ({
       family,
-      models: models.sort((a, b) => a.id.localeCompare(b.id)),
+      models: [...models].sort((a, b) => a.id.localeCompare(b.id)),
     }))
 }
 

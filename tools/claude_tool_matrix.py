@@ -79,6 +79,7 @@ class EventSummary:
     result_subtype: str = ""
     raw_event_count: int = 0
     parse_errors: int = 0
+    available_tools: list[str] = dataclasses.field(default_factory=list)
 
     def tool_names(self) -> list[str]:
         """返回本次运行中出现过的工具名。"""
@@ -180,7 +181,8 @@ def main() -> int:
     models = resolve_models(args, api_key)
     scenarios = build_scenarios(include_p1=args.include_p1)
     selected_scenarios = filter_scenarios(scenarios, args.tests)
-    write_manifest(result_root, args, models, selected_scenarios)
+    discovered_tools = discover_available_tools(args, result_root) if args.execute else []
+    write_manifest(result_root, args, models, selected_scenarios, discovered_tools)
 
     if not args.execute:
         print_preview(result_root, models, selected_scenarios, args)
@@ -220,6 +222,7 @@ def main() -> int:
                 scenarios=selected_scenarios,
                 env_api_key=api_key,
                 fp=fp,
+                discovered_tools=discovered_tools,
             )
             results.extend(model_results)
 
@@ -258,6 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=180, help="单场景默认超时时间。")
     parser.add_argument("--retries", type=int, default=1, help="失败后重试次数。")
     parser.add_argument("--permission-mode", default="acceptEdits", help="Claude Code 权限模式。")
+    parser.add_argument("--isolation-mode", choices=("safe", "bare", "normal"), default="safe", help="Claude Code 启动隔离模式：safe 保留内置工具并禁用自定义项；bare 工具最少；normal 使用完整本机配置。")
     parser.add_argument("--verbose", action="store_true", help="输出每个场景进度。")
 
     args = parser.parse_args()
@@ -363,6 +367,7 @@ def build_scenarios(include_p1: bool) -> list[Scenario]:
         scenario_edit(),
         scenario_multiedit(),
         scenario_bash(),
+        scenario_core_chain(),
         scenario_p0_chain(),
     ]
     if include_p1:
@@ -395,11 +400,33 @@ def run_model_matrix(
     scenarios: list[Scenario],
     env_api_key: str,
     fp: Any,
+    discovered_tools: list[str],
 ) -> list[ScenarioResult]:
     """执行单个模型的所有场景，P1 只在 P0 通过后继续。"""
     results: list[ScenarioResult] = []
     p0_failed = False
+    discovered_tool_set = set(discovered_tools)
     for scenario in scenarios:
+        global_unavailable = [tool for tool in scenario.tools if discovered_tool_set and tool not in discovered_tool_set]
+        if global_unavailable:
+            result = ScenarioResult(
+                model=model.model_id,
+                scenario=scenario.name,
+                phase=scenario.phase,
+                status=SKIP,
+                reason="当前 Claude Code 隔离模式未暴露目标工具：" + ", ".join(global_unavailable),
+                duration_seconds=0.0,
+                attempts=0,
+                case_dir="",
+                tools_seen=[],
+                stdout_path="",
+                stderr_path="",
+                metadata={"discovered_tools": discovered_tools},
+            )
+            emit_result(fp, result)
+            results.append(result)
+            continue
+
         if scenario.phase == "P1" and p0_failed:
             result = ScenarioResult(
                 model=model.model_id,
@@ -427,7 +454,7 @@ def run_model_matrix(
         )
         emit_result(fp, result)
         results.append(result)
-        if scenario.phase == "P0" and result.status != PASS:
+        if scenario.phase == "P0" and result.status in {FAIL, PARTIAL, UNSTABLE}:
             p0_failed = True
     return results
 
@@ -502,6 +529,29 @@ def run_one_scenario(
         stderr_path.write_text(command_result.stderr, encoding="utf-8")
 
         events = parse_stream_json(command_result.stdout)
+        unavailable = [tool for tool in scenario.tools if tool not in events.available_tools]
+        if unavailable:
+            metadata = {
+                "available_tools": events.available_tools,
+                "returncode": command_result.returncode,
+                "timed_out": command_result.timed_out,
+                "result_subtype": events.result_subtype,
+                "parse_errors": events.parse_errors,
+            }
+            return ScenarioResult(
+                model=model.model_id,
+                scenario=scenario.name,
+                phase=scenario.phase,
+                status=SKIP,
+                reason="当前 Claude Code 初始化未暴露目标工具：" + ", ".join(unavailable),
+                duration_seconds=command_result.duration_seconds,
+                attempts=attempt,
+                case_dir=str(case_dir),
+                tools_seen=events.tool_names(),
+                stdout_path=str(stdout_path),
+                stderr_path=str(stderr_path),
+                metadata=metadata,
+            )
         status, reason, metadata = scenario.validate(case_dir, state, events, command_result)
         metadata.update({
             "returncode": command_result.returncode,
@@ -556,15 +606,20 @@ def build_claude_command(
 ) -> list[str]:
     """生成 Claude Code 子进程命令。"""
     tool_csv = ",".join(scenario.tools)
-    return [
+    command = [
         args.claude_bin,
-        "--bare",
         "--print",
+        "--verbose",
+    ]
+    if args.isolation_mode == "safe":
+        command.append("--safe-mode")
+    elif args.isolation_mode == "bare":
+        command.append("--bare")
+    command.extend([
         "--model",
         model_id,
         "--output-format",
         "stream-json",
-        "--verbose",
         "--permission-mode",
         args.permission_mode,
         "--add-dir",
@@ -573,7 +628,8 @@ def build_claude_command(
         f"--allowedTools={tool_csv}",
         "--",
         prompt,
-    ]
+    ])
+    return command
 
 
 def build_claude_env(args: argparse.Namespace, api_key: str) -> dict[str, str]:
@@ -584,6 +640,15 @@ def build_claude_env(args: argparse.Namespace, api_key: str) -> dict[str, str]:
     env["ANTHROPIC_API_KEY"] = api_key
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
+
+
+def coerce_text(value: Any) -> str:
+    """把 subprocess 可能返回的 bytes/None 统一转成字符串。"""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
 
 
 def run_claude_command(command: list[str], env: dict[str, str], cwd: pathlib.Path, timeout_seconds: int) -> CommandResult:
@@ -609,8 +674,8 @@ def run_claude_command(command: list[str], env: dict[str, str], cwd: pathlib.Pat
     except subprocess.TimeoutExpired as exc:
         return CommandResult(
             returncode=124,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or "",
+            stdout=coerce_text(exc.stdout),
+            stderr=coerce_text(exc.stderr),
             duration_seconds=time.monotonic() - started,
             timed_out=True,
         )
@@ -630,6 +695,9 @@ def parse_stream_json(stdout: str) -> EventSummary:
             summary.parse_errors += 1
             continue
         summary.raw_event_count += 1
+
+        if event.get("subtype") == "init" and isinstance(event.get("tools"), list):
+            summary.available_tools = [str(item) for item in event.get("tools", [])]
 
         event_type = event.get("type")
         if event_type == "assistant":
@@ -825,7 +893,7 @@ def scenario_read() -> Scenario:
 
 def scenario_write() -> Scenario:
     """构造 Write 场景。"""
-    expected = '{\n  "message": "中文 hello",\n  "quote": "He said \\\"yes\\\"",\n  "xml": "<tag attr=\\\"1\\\">value</tag>"\n}\n'
+    expected = '{\n  "message": "中文 hello",\n  "quote": "He said \\\"yes\\\"",\n  "xml": "<tag attr=\\\"1\\\">value</tag>"\n}'
 
     def seed(case_dir: pathlib.Path) -> dict[str, Any]:
         return {"path": case_dir / "probe-write.json", "expected": expected}
@@ -864,17 +932,19 @@ def scenario_edit() -> Scenario:
         return {"path": path, "after": after}
 
     def prompt(case_dir: pathlib.Path, state: dict[str, Any]) -> str:
-        return f"Use the Edit tool to replace EDIT_TARGET_OLD with EDIT_TARGET_NEW in {state['path']}. Do not use Write or Bash."
+        return f"First use Read on {state['path']} because Claude Code requires reading before editing. Then use Edit to replace EDIT_TARGET_OLD with EDIT_TARGET_NEW. Do not use Write or Bash."
 
     def validate(case_dir: pathlib.Path, state: dict[str, Any], events: EventSummary, result: CommandResult) -> tuple[str, str, dict[str, Any]]:
+        if not events.has_tool("Read"):
+            return FAIL, "Edit 前未观察到 Read 工具调用", {"tools_seen": events.tool_names()}
         if not events.has_tool("Edit"):
-            return FAIL, "未观察到 Edit 工具调用", {}
+            return FAIL, "未观察到 Edit 工具调用", {"tools_seen": events.tool_names()}
         actual = state["path"].read_text(encoding="utf-8")
         if actual == state["after"]:
             return PASS, "Edit 精确替换成功", {}
         return FAIL, "Edit 后文件内容不符合预期", {"actual": actual}
 
-    return Scenario("Edit", "P0", ("Edit",), seed, prompt, validate)
+    return Scenario("Edit", "P0", ("Read", "Edit"), seed, prompt, validate)
 
 
 def scenario_multiedit() -> Scenario:
@@ -935,6 +1005,50 @@ def scenario_bash() -> Scenario:
         return PARTIAL, "Bash 已调用，但最终回答未包含命令输出", {"command": command, "final_text": text[-500:]}
 
     return Scenario("Bash", "P0", ("Bash",), seed, prompt, validate)
+
+
+def scenario_core_chain() -> Scenario:
+    """构造当前 Claude Code 可用核心工具链路场景。"""
+    def seed(case_dir: pathlib.Path) -> dict[str, Any]:
+        secret = "CORE_SECRET_" + hashlib.sha1(str(case_dir).encode()).hexdigest()[:8]
+        target = case_dir / "core-target.txt"
+        target.write_text(f"status=CORE_OLD\nsecret={secret}\n", encoding="utf-8")
+        report = case_dir / "core-report.txt"
+        marker = "CORE_CHAIN_OK_" + secret.rsplit("_", 1)[-1]
+        return {"target": target, "report": report, "secret": secret, "marker": marker}
+
+    def prompt(case_dir: pathlib.Path, state: dict[str, Any]) -> str:
+        return textwrap.dedent(f"""
+        Complete this workflow using tools only where requested:
+        1. Use Read on {state['target']} and remember the secret value from the file.
+        2. Use Edit to replace CORE_OLD with CORE_NEW in {state['target']}.
+        3. Use Write to create {state['report']} with exactly: report={state['secret']}
+        4. Use Bash to verify both files, with this exact command:
+           python3 -c "from pathlib import Path; assert 'CORE_NEW' in Path('core-target.txt').read_text(); assert Path('core-report.txt').read_text() == 'report={state['secret']}'; print('{state['marker']}')"
+        5. After Bash returns, answer with exactly the printed marker.
+        Do not skip any of the four tool types.
+        """).strip()
+
+    def validate(case_dir: pathlib.Path, state: dict[str, Any], events: EventSummary, result: CommandResult) -> tuple[str, str, dict[str, Any]]:
+        required = {"Read", "Edit", "Write", "Bash"}
+        seen = set(events.tool_names())
+        missing = sorted(required - seen)
+        target_ok = "CORE_NEW" in state["target"].read_text(encoding="utf-8")
+        report_ok = state["report"].exists() and state["report"].read_text(encoding="utf-8") == f"report={state['secret']}"
+        text_ok = state["marker"] in final_text(events)
+        if missing:
+            return FAIL, "CoreChain 缺少工具调用：" + ", ".join(missing), {"seen": sorted(seen)}
+        if target_ok and report_ok and text_ok:
+            return PASS, "CoreChain 核心工具链成功", {}
+        status = PARTIAL if target_ok and report_ok else FAIL
+        return status, "CoreChain 工具齐全但副作用或最终回答不完整", {
+            "target_ok": target_ok,
+            "report_ok": report_ok,
+            "text_ok": text_ok,
+            "final_text": final_text(events)[-500:],
+        }
+
+    return Scenario("CoreChain", "P0", ("Read", "Edit", "Write", "Bash"), seed, prompt, validate, timeout_seconds=240)
 
 
 def scenario_p0_chain() -> Scenario:
@@ -1162,7 +1276,41 @@ def emit_result(fp: Any, result: ScenarioResult) -> None:
     fp.flush()
 
 
-def write_manifest(result_root: pathlib.Path, args: argparse.Namespace, models: list[ModelEntry], scenarios: list[Scenario]) -> None:
+def discover_available_tools(args: argparse.Namespace, result_root: pathlib.Path) -> list[str]:
+    """通过 Claude Code 初始化事件发现当前隔离模式实际可用工具。"""
+    case_dir = result_root / "tool-discovery"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        args.claude_bin,
+        "--print",
+        "--verbose",
+    ]
+    if args.isolation_mode == "safe":
+        command.append("--safe-mode")
+    elif args.isolation_mode == "bare":
+        command.append("--bare")
+    command.extend([
+        "--model",
+        "qwen3.6-plus",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        args.permission_mode,
+        "--add-dir",
+        str(case_dir),
+        "--",
+        "Initialize only. Do not call tools.",
+    ])
+
+    env = build_claude_env(args, "sk-invalid-tool-discovery")
+    result = run_claude_command(command=command, env=env, cwd=case_dir, timeout_seconds=30)
+    (case_dir / "claude.stdout.jsonl").write_text(result.stdout, encoding="utf-8")
+    (case_dir / "claude.stderr.log").write_text(result.stderr, encoding="utf-8")
+    events = parse_stream_json(result.stdout)
+    return events.available_tools
+
+
+def write_manifest(result_root: pathlib.Path, args: argparse.Namespace, models: list[ModelEntry], scenarios: list[Scenario], discovered_tools: list[str]) -> None:
     """写入本次测试清单，避免记录敏感 API Key。"""
     manifest = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1172,8 +1320,10 @@ def write_manifest(result_root: pathlib.Path, args: argparse.Namespace, models: 
         "api_key_envs": args.api_key_envs,
         "models": [dataclasses.asdict(model) for model in models],
         "scenarios": [{"name": item.name, "phase": item.phase, "tools": list(item.tools)} for item in scenarios],
+        "discovered_tools": discovered_tools,
         "include_p1": bool(args.include_p1),
         "include_aliases": bool(args.include_aliases),
+        "isolation_mode": args.isolation_mode,
         "timeout": args.timeout,
         "retries": args.retries,
     }
@@ -1219,7 +1369,8 @@ def write_summary(result_root: pathlib.Path, results: list[ScenarioResult]) -> p
     for model, items in by_model.items():
         p0_items = [item for item in items if item.phase == "P0"]
         p1_items = [item for item in items if item.phase == "P1"]
-        model_pass = all(item.status == PASS for item in p0_items) if p0_items else False
+        p0_effective = [item for item in p0_items if item.status != SKIP]
+        model_pass = bool(p0_effective) and all(item.status == PASS for item in p0_effective)
         lines.append(f"### {model}")
         lines.append("")
         lines.append(f"- P0：{'通过' if model_pass else '未通过'}")
