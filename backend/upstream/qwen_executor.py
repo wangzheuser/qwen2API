@@ -9,6 +9,7 @@ from backend.core.request_trace import find_test_markers, prompt_tail
 from backend.services.auth_resolver import AuthResolver
 from backend.upstream.payload_builder import build_chat_payload, normalize_upstream_chat_type
 from backend.upstream.sse_consumer import parse_sse_chunk
+from backend.upstream.waf import format_waf_error, is_waf_challenge
 
 log = logging.getLogger("qwen2api.executor")
 
@@ -118,6 +119,8 @@ class QwenExecutor:
         else:
             r = await request_fn("POST", "/api/v2/chats/new", token, body)
         body_text = r.get("body", "")
+        if is_waf_challenge(body_text):
+            raise Exception(format_waf_error(body_text, r.get("status")))
         if r["status"] != 200:
             body_lower = body_text.lower()
             if (
@@ -140,6 +143,8 @@ class QwenExecutor:
                 raise Exception("Qwen API returned error or missing id")
             return data["data"]["id"]
         except Exception as e:
+            if is_waf_challenge(body_text):
+                raise Exception(format_waf_error(body_text, r.get("status")))
             body_lower = body_text.lower()
             if any(
                 kw in body_lower

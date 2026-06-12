@@ -1,7 +1,9 @@
 import asyncio
+from datetime import datetime
 import json
 import logging
 import time
+import uuid
 from typing import AsyncIterator
 
 import httpx
@@ -19,6 +21,7 @@ from backend.services.auth_resolver import BASE_URL, AuthResolver
 from backend.upstream.payload_builder import build_chat_payload
 from backend.upstream.qwen_executor import QwenExecutor
 from backend.upstream.sse_consumer import parse_sse_chunk
+from backend.upstream.waf import format_waf_error, is_waf_challenge
 
 log = logging.getLogger("qwen2api.client")
 
@@ -129,17 +132,38 @@ class QwenClient:
             raise
 
     @staticmethod
-    def _build_headers(token: str) -> dict[str, str]:
-        return {
+    def _format_browser_timezone() -> str:
+        """生成与浏览器 Date.toString() 近似的 Timezone 请求头。"""
+        return datetime.now().astimezone().strftime("%a %b %d %Y %H:%M:%S GMT%z")
+
+    def _build_headers(self, token: str, account=None) -> dict[str, str]:
+        """构造与 Qwen Web 前端一致的上游请求头。"""
+        headers = {
             "Authorization": f"Bearer {token}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": f"{BASE_URL}/",
             "Origin": BASE_URL,
             "Connection": "keep-alive",
             "Content-Type": "application/json",
+            "Version": "0.2.64",
+            "source": "desktop",
+            "Timezone": self._format_browser_timezone(),
+            "X-Request-Id": str(uuid.uuid4()),
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
+        acc = account or self._account_for_token(token)
+        cookies = getattr(acc, "cookies", "") if acc is not None else ""
+        if cookies:
+            # 浏览器修复流程如果保存了 Qwen Cookie，则协议请求应复用同一登录态。
+            headers["Cookie"] = cookies
+        return headers
 
     async def _request_json(
         self,
@@ -159,7 +183,7 @@ class QwenClient:
             token=token,
             account=account,
             force_proxy_refresh=force_proxy_refresh,
-            headers=self._build_headers(token),
+            headers=self._build_headers(token, account=account),
             json=body,
             timeout=timeout,
         )
@@ -345,7 +369,7 @@ class QwenClient:
             "违规",
         )):
             return "banned", "账号疑似被封禁或禁用"
-        if "aliyun_waf" in lower or "<!doctype" in lower or "captcha" in lower:
+        if is_waf_challenge(text):
             return "unknown", "官网返回风控/WAF 页面，需浏览器登录刷新后复验"
         if status_code in (401, 403):
             return "auth_error", "Token 已失效或认证失败"
@@ -691,9 +715,19 @@ class QwenClient:
             async with client.stream(
                 "POST",
                 f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
-                headers={**self._build_headers(token), "Accept": "text/event-stream"},
+                headers={**self._build_headers(token, account=acc), "Accept": "text/event-stream"},
                 json=payload,
             ) as resp:
+                content_type = resp.headers.get("content-type", "")
+                if is_waf_challenge("", content_type):
+                    body = await resp.aread()
+                    raise RuntimeError(format_waf_error(body, resp.status_code))
+                if resp.status_code == 200 and "text/event-stream" not in content_type.lower():
+                    body = await resp.aread()
+                    if is_waf_challenge(body, content_type):
+                        raise RuntimeError(format_waf_error(body, resp.status_code))
+                    yield {"status": resp.status_code, "body": body}
+                    return
                 if resp.status_code != 200:
                     yield {"status": resp.status_code, "body": await resp.aread()}
                     return
