@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 ARG GO_VERSION=1.26
 ARG NODE_VERSION=20
 
@@ -13,6 +11,8 @@ RUN npm run build
 
 # Stage 2: build the Go backend.
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS backend-builder
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./backend/
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -71,8 +71,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=backend-builder /out/qwen2api /usr/local/bin/qwen2api
 COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
 
+ARG INSTALL_BROWSERS=true
 RUN mkdir -p /app/data /app/logs /ms-playwright \
-    && /usr/local/bin/qwen2api --install-browsers
+    && if [ "${INSTALL_BROWSERS}" = "true" ]; then \
+        /usr/local/bin/qwen2api --install-browsers; \
+    else \
+        echo "Skipping Playwright browser install during image build"; \
+    fi
 
 EXPOSE 7860
 
