@@ -58,10 +58,47 @@ export default function TokensPage() {
     loadKeys()
   }, [loadKeys])
 
-  const copyToClipboard = async (text: string) => {
-    await navigator.clipboard.writeText(text)
-    setCopied(text)
+  /**
+   * 复制完整 Key，并返回复制是否成功。
+   */
+  const copyToClipboard = async (text: string, notifySuccess = true): Promise<boolean> => {
+    const value = text.trim()
+    if (!value) {
+      toast.error("没有可复制的内容")
+      return false
+    }
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value)
+      } else {
+        throw new Error("clipboard unavailable")
+      }
+    } catch {
+      try {
+        const textarea = document.createElement("textarea")
+        textarea.value = value
+        textarea.setAttribute("readonly", "")
+        textarea.style.position = "fixed"
+        textarea.style.left = "-9999px"
+        document.body.appendChild(textarea)
+        textarea.select()
+        // 在非安全上下文中回退到传统复制接口，兼容 HTTP 部署。
+        const ok = document.execCommand("copy")
+        document.body.removeChild(textarea)
+        if (!ok) {
+          throw new Error("copy failed")
+        }
+      } catch {
+        toast.error("复制失败，请检查浏览器剪贴板权限（HTTP 环境可能受限，可改用 HTTPS 或 localhost 访问）")
+        return false
+      }
+    }
+    setCopied(value)
+    if (notifySuccess) {
+      toast.success("已复制到剪贴板")
+    }
     window.setTimeout(() => setCopied(null), 1800)
+    return true
   }
 
   const handleCreate = () => {
@@ -84,8 +121,8 @@ export default function TokensPage() {
     }).then(async res => {
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
-        toast.success(createMode === "custom" ? "自定义 API Key 已添加" : "已生成新的 API Key，并复制到剪贴板", { id })
-        if (data.key) void copyToClipboard(data.key)
+        const copiedKey = data.key ? await copyToClipboard(data.key, false) : false
+        toast.success(createMode === "custom" ? "自定义 API Key 已添加" : copiedKey ? "已生成新的 API Key，并复制到剪贴板" : "已生成新的 API Key，请从列表手动复制", { id })
         setCreateOpen(false)
         setCustomKey("")
         setCreateMode("auto")
