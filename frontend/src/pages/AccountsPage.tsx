@@ -923,7 +923,7 @@ export default function AccountsPage() {
           <div className="account-selected-action-row xl:justify-end">
             <span className="rounded-full bg-muted px-3 py-1 text-xs font-bold text-muted-foreground">已选 {selectedAccounts.length}</span>
             <Button variant="ghost" size="sm" onClick={handleVerifySelected} disabled={!selectedAccounts.length}>
-              <RefreshCw className="mr-2 size-4" /> 刷新选中 GPT 账号信息和额度
+              <RefreshCw className="mr-2 size-4" /> 刷新账号信息和额度
             </Button>
             <Button variant="ghost" size="sm" onClick={handleDeleteSelected} disabled={!selectedAccounts.length} className="text-rose-600 hover:text-rose-600">
               <Trash2 className="mr-2 size-4" /> 删除所选
