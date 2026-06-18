@@ -66,6 +66,9 @@ type App struct {
 	keepalive         *KeepAliveService
 	videoTasks        map[string]*VideoTask
 	videoTasksMu      sync.RWMutex
+	mediaWAFMu        sync.Mutex
+	mediaWAFUntil     time.Time
+	mediaWAFLastError string
 }
 
 func main() {
@@ -574,6 +577,9 @@ func (p *AccountPool) pickLockedFor(preferredEmail, usage string) *Account {
 		return nil
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		if (candidates[i].Cookies != "") != (candidates[j].Cookies != "") {
+			return candidates[i].Cookies != ""
+		}
 		if candidates[i].Inflight != candidates[j].Inflight {
 			return candidates[i].Inflight < candidates[j].Inflight
 		}
@@ -1141,6 +1147,33 @@ func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, 
 	if app.logger != nil {
 		app.logger.Info("账号激活流程开始", "account", acc.Email)
 	}
+	if acc.Token != "" {
+		if app.logger != nil {
+			app.logger.Info("账号激活先尝试用现有 token 刷新浏览器会话", "account", acc.Email)
+		}
+		if err := app.withBrowser(ctx, func(page pw.Page) error {
+			cookies, err := refreshQwenBrowserSession(ctx, page, acc.Token)
+			if err != nil {
+				return err
+			}
+			acc.Cookies = cookies
+			return nil
+		}); err == nil {
+			verify := app.client.VerifyTokenDetailForAccount(ctx, &acc)
+			if verify.Valid && acc.Cookies != "" {
+				acc.Valid = true
+				acc.ActivationPending = false
+				acc.StatusCode = "valid"
+				acc.LastError = ""
+				if app.logger != nil {
+					app.logger.Info("账号现有 token 浏览器会话刷新成功", "account", acc.Email, "cookies_found", acc.Cookies != "")
+				}
+				return acc, true, nil
+			}
+		} else if app.logger != nil {
+			app.logger.Warn("账号现有 token 浏览器会话刷新失败，继续激活流程", "account", acc.Email, "error", err)
+		}
+	}
 	mail := NewMailSession()
 	verifyLink := mail.PollVerifyLink(ctx, acc.Email, 30*time.Second)
 	if app.logger != nil {
@@ -1191,8 +1224,12 @@ func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, 
 			acc.ActivationPending = false
 			acc.StatusCode = "valid"
 			acc.LastError = ""
+			// 现有 Token 可用时也保留浏览器侧 Cookie，供后续媒体请求携带验证态。
+			if cookies := qwenCookieString(page); cookies != "" {
+				acc.Cookies = cookies
+			}
 			if app.logger != nil {
-				app.logger.Info("账号激活未获取新 token，但现有 token 验证通过", "account", acc.Email)
+				app.logger.Info("账号激活未获取新 token，但现有 token 验证通过", "account", acc.Email, "cookies_found", acc.Cookies != "")
 			}
 			return nil
 		}
@@ -1285,6 +1322,75 @@ func loginAndGetToken(ctx context.Context, page pw.Page, email, password string,
 		sleepWithContext(ctx, time.Second)
 	}
 	return ""
+}
+
+// refreshQwenBrowserSession 将现有 token 写入浏览器上下文并触发 Qwen 前端初始化，用于采集 Baxia/AWSC Cookie。
+func refreshQwenBrowserSession(ctx context.Context, page pw.Page, token string) (string, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", errors.New("empty token")
+	}
+	if _, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{WaitUntil: pw.WaitUntilStateDomcontentloaded, Timeout: pw.Float(30000)}); err != nil {
+		return "", err
+	}
+	_, _ = page.Evaluate(`(token) => {
+		localStorage.setItem('token', token);
+		document.cookie = 'token=' + encodeURIComponent(token) + '; path=/; max-age=31536000';
+		document.cookie = 'qwen_token=' + encodeURIComponent(token) + '; path=/; max-age=31536000';
+	}`, token)
+	if _, err := page.Reload(pw.PageReloadOptions{WaitUntil: pw.WaitUntilStateDomcontentloaded, Timeout: pw.Float(30000)}); err != nil {
+		return "", err
+	}
+	// 等待前端加载 Baxia/AWSC，并主动触发受保护接口，促使浏览器生成验证态。
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		_, _ = page.Evaluate(`async () => {
+			try {
+				if (window.baxiaCommon && window.__baxia__ && window.__baxia__.baxiaPromptInit && !window.baxiaInitialized) {
+					window.baxiaCommon.init({
+						appendTo: 'header',
+						uabOptions: { location: 'sea' },
+						checkApiPath: (url) => ['/api/v2/chats', '/api/v2/chat/completions', '/api/v2/files/getstsToken', '/api/v1/tasks/status'].some(path => String(url || '').includes(path)),
+						paramstype: ['uab', 'umid'],
+						autoSize: true
+					});
+					window.baxiaInitialized = true;
+				}
+			} catch (_) {}
+			try {
+				await fetch('/api/v2/user/info', { credentials: 'include' });
+			} catch (_) {}
+			try {
+				await fetch('/api/v2/chats?limit=1', { credentials: 'include' });
+			} catch (_) {}
+			return Boolean(document.cookie);
+		}`)
+		if cookies := qwenCookieString(page); hasQwenVerificationCookie(cookies) {
+			return cookies, nil
+		}
+		sleepWithContext(ctx, time.Second)
+	}
+	return "", errors.New("qwen browser verification cookie not found")
+}
+
+// hasQwenVerificationCookie 判断浏览器是否产生了非 token 的验证态 Cookie。
+func hasQwenVerificationCookie(cookies string) bool {
+	for _, part := range strings.Split(cookies, ";") {
+		name := strings.TrimSpace(strings.SplitN(part, "=", 2)[0])
+		if name == "" {
+			continue
+		}
+		switch strings.ToLower(name) {
+		case "token", "qwen_token":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 func fillFirst(page pw.Page, selectors []string, value string, timeoutMS float64) bool {
@@ -1670,7 +1776,7 @@ func (p *ChatIDPool) Fill(ctx context.Context) {
 func (p *ChatIDPool) createWarmChat(ctx context.Context, acc Account, warmKey ModelWarmKey) {
 	fillCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	chatID, err := p.client.CreateChat(fillCtx, acc.Token, warmKey.Model, warmKey.ChatType)
+	chatID, err := p.client.CreateChatForAccount(fillCtx, &acc, warmKey.Model, warmKey.ChatType)
 	if err != nil {
 		logWarn(p.logger, ctx, "预热会话创建失败", "account", acc.Email, "model", warmKey.Model, "chat_type", warmKey.ChatType, "error", err)
 		return
@@ -1780,6 +1886,10 @@ type Settings struct {
 	UpstreamStreamFirstEventTimeoutSeconds int
 	UpstreamStreamIdleTimeoutSeconds       int
 	MaxRetries                             int
+	MediaMaxRetries                        int
+	ImageMaxRetries                        int
+	VideoMaxRetries                        int
+	MediaWAFBreakerCooldownSeconds         int
 	ToolRecoveryMaxAttempts                int
 	RateLimitCooldown                      int
 	AccountMinIntervalMS                   int
@@ -1830,6 +1940,7 @@ func LoadSettings() Settings {
 	}
 	data := envString("DATA_DIR", filepath.Join(base, "data"))
 	logs := envString("LOGS_DIR", filepath.Join(base, "logs"))
+	maxRetries := envInt("MAX_RETRIES", 3)
 	settings := Settings{
 		Port:                                   envInt("PORT", 7860),
 		Workers:                                envInt("WORKERS", 1),
@@ -1840,7 +1951,11 @@ func LoadSettings() Settings {
 		UpstreamStreamHeaderTimeoutSeconds:     envInt("UPSTREAM_STREAM_HEADER_TIMEOUT_SECONDS", 120),
 		UpstreamStreamFirstEventTimeoutSeconds: envInt("UPSTREAM_STREAM_FIRST_EVENT_TIMEOUT_SECONDS", 180),
 		UpstreamStreamIdleTimeoutSeconds:       envInt("UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 180),
-		MaxRetries:                             envInt("MAX_RETRIES", 3),
+		MaxRetries:                             maxRetries,
+		MediaMaxRetries:                        envInt("MEDIA_MAX_RETRIES", maxRetries),
+		ImageMaxRetries:                        envInt("IMAGE_MAX_RETRIES", 0),
+		VideoMaxRetries:                        envInt("VIDEO_MAX_RETRIES", 0),
+		MediaWAFBreakerCooldownSeconds:         envInt("MEDIA_WAF_BREAKER_COOLDOWN_SECONDS", 600),
 		ToolRecoveryMaxAttempts:                clampInt(envInt("TOOL_RECOVERY_MAX_ATTEMPTS", 4), 1, 8),
 		RateLimitCooldown:                      600,
 		AccountMinIntervalMS:                   envInt("ACCOUNT_MIN_INTERVAL_MS", 0),
@@ -2602,7 +2717,7 @@ func (app *App) acquireCompletionChat(ctx context.Context, req StandardRequest, 
 		if reused {
 			return acc, chatID, true, nil
 		}
-		chatID, err = app.client.CreateChat(ctx, acc.Token, req.ResolvedModel, req.ChatType)
+		chatID, err = app.client.CreateChatForAccount(ctx, acc, req.ResolvedModel, req.ChatType)
 		if err == nil {
 			return acc, chatID, false, nil
 		}
@@ -2659,7 +2774,7 @@ func (app *App) runCompletionWithHooks(ctx context.Context, req StandardRequest,
 		}
 		return nil
 	}
-	err = app.client.StreamChat(ctx, acc.Token, chatID, payload, func(evt UpstreamEvent) error {
+	err = app.client.StreamChatForAccount(ctx, acc, chatID, payload, func(evt UpstreamEvent) error {
 		result.Events = append(result.Events, evt)
 		if evt.Type != "delta" || evt.Content == "" {
 			return nil
@@ -4076,7 +4191,7 @@ func isAcceptableNoToolContinuationText(req StandardRequest, result CompletionRe
 }
 
 func (app *App) runToolMarkupRecoveryAttempt(ctx context.Context, acc *Account, req StandardRequest, prompt, reason string) (CompletionResult, error) {
-	chatID, err := app.client.CreateChat(ctx, acc.Token, req.ResolvedModel, req.ChatType)
+	chatID, err := app.client.CreateChatForAccount(ctx, acc, req.ResolvedModel, req.ChatType)
 	if err != nil {
 		app.classifyAccountError(acc, err)
 		return CompletionResult{}, err
@@ -4090,7 +4205,7 @@ func (app *App) runToolMarkupRecoveryAttempt(ctx context.Context, acc *Account, 
 	if req.ToolEnabled {
 		sieve = toolcall.NewToolSieve(req.Tools)
 	}
-	err = app.client.StreamChat(ctx, acc.Token, chatID, payload, func(evt UpstreamEvent) error {
+	err = app.client.StreamChatForAccount(ctx, acc, chatID, payload, func(evt UpstreamEvent) error {
 		result.Events = append(result.Events, evt)
 		if evt.Type != "delta" || evt.Content == "" {
 			return nil
@@ -4392,6 +4507,12 @@ func (app *App) classifyAccountErrorFor(acc *Account, err error, usage string) {
 		}
 		return
 	}
+	if isUpstreamWAFErrorMessage(lower) {
+		if app.logger != nil {
+			app.logger.Warn("上游 WAF 风控拦截，未标记账号失效", "account", acc.Email, "usage", normalizeAccountUsage(usage), "error", truncate(msg, 240))
+		}
+		return
+	}
 	if isTransientUpstreamErrorMessage(lower) {
 		usage = normalizeAccountUsage(usage)
 		cooldown := transientUpstreamCooldownSeconds(app.settings)
@@ -4507,10 +4628,48 @@ func isRetryableCreateChatError(err error) bool {
 	if isModelNotFoundErrorMessage(msg) {
 		return false
 	}
+	if isUpstreamWAFErrorMessage(msg) {
+		return false
+	}
 	if isRateLimitErrorMessage(msg) || isTransientUpstreamErrorMessage(msg) {
 		return true
 	}
 	return false
+}
+
+func isUpstreamWAFErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	if strings.TrimSpace(lower) == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"aliyun_waf",
+		"aliyuncaptcha",
+		"cf_app_waf",
+		"fail_sys_user_validate",
+		"rgv587_error",
+		"x5secdata",
+		"purecaptcha",
+		"_____tmd_____/punish",
+		"action=captcha",
+		"u_atoken",
+		"u_asig",
+		"sliding verification",
+		"access verification",
+		"访问验证",
+		"请进行验证",
+		"captcha-element",
+		"bxpunish",
+		"bxuuid",
+		"waf 风控",
+		"waf challenge",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return (strings.Contains(lower, "<!doctype") || strings.Contains(lower, "<html")) &&
+		(strings.Contains(lower, "captcha") || strings.Contains(lower, "waf") || strings.Contains(lower, "access verification") || strings.Contains(lower, "访问验证"))
 }
 
 func isTransientUpstreamErrorMessage(lower string) bool {
@@ -5821,8 +5980,14 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 
 func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any) ([]string, error) {
 	var lastErr error
-	attempts := app.mediaRetryAttempts()
+	if err := app.mediaWAFCircuitError(); err != nil {
+		return nil, err
+	}
+	attempts := app.mediaRetryAttempts(accountUsageImage)
 	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		acc, err := app.accounts.AcquireFor(ctx, "", accountUsageImage)
 		if err != nil {
 			app.logWarn(ctx, "图片生成获取账号失败", "attempt", attempt+1, "error", err)
@@ -5833,11 +5998,14 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			setRequestLogFields(ctx, "account", acc.Email)
 			app.logInfo(ctx, "图片生成开始尝试", "attempt", attempt+1, "model", model)
 
-			chatID, err := app.client.CreateChat(ctx, acc.Token, model, "image_gen")
+			chatID, err := app.client.CreateChatForAccount(ctx, acc, model, "image_gen")
 			if err != nil {
 				app.classifyAccountErrorFor(acc, err, accountUsageImage)
 				lastErr = err
 				app.logWarn(ctx, "图片生成创建会话失败", "attempt", attempt+1, "error", err)
+				if isUpstreamWAFErrorMessage(err.Error()) {
+					app.tripMediaWAFCircuit(err)
+				}
 				return
 			}
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
@@ -5845,7 +6013,7 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 
 			payload := buildChatPayload(chatID, model, promptText, false, nil, "image_gen", imageOptions, nil, false)
 			parts := []string{}
-			if err := app.client.StreamChat(ctx, acc.Token, chatID, payload, func(evt UpstreamEvent) error {
+			if err := app.client.StreamChatForAccount(ctx, acc, chatID, payload, func(evt UpstreamEvent) error {
 				if evt.Content != "" {
 					parts = append(parts, evt.Content)
 				}
@@ -5857,14 +6025,17 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				app.classifyAccountErrorFor(acc, err, accountUsageImage)
 				lastErr = err
 				app.logWarn(ctx, "图片生成上游流式失败", "attempt", attempt+1, "error", err, "parts", len(parts))
+				if isUpstreamWAFErrorMessage(err.Error()) {
+					app.tripMediaWAFCircuit(err)
+				}
 				return
 			}
 
 			answerText := strings.Join(parts, "\n")
-			if _, detail, err := app.client.GetChatDetail(ctx, acc.Token, chatID, 30*time.Second); err == nil && detail != "" {
+			if _, detail, err := app.client.GetChatDetailForAccount(ctx, acc, chatID, 30*time.Second); err == nil && detail != "" {
 				answerText += "\n" + detail
 			}
-			if chats, err := app.client.ListChats(ctx, acc.Token, 20); err == nil {
+			if chats, err := app.client.ListChatsForAccount(ctx, acc, 20); err == nil {
 				for _, chat := range chats {
 					if stringValue(chat, "id", "") == chatID {
 						answerText += "\n" + mustJSON(chat)
@@ -5876,6 +6047,9 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				lastErr = fmt.Errorf("%s", failure)
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageImage)
 				app.logWarn(ctx, "图片生成上游返回失败", "attempt", attempt+1, "failure", failure)
+				if isUpstreamWAFErrorMessage(failure) {
+					app.tripMediaWAFCircuit(lastErr)
+				}
 				return
 			}
 
@@ -5897,6 +6071,9 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			}
 		}
 		app.logWarn(ctx, "图片生成尝试失败", "attempt", attempt+1, "error", lastErr)
+		if lastErr != nil && isUpstreamWAFErrorMessage(lastErr.Error()) {
+			return nil, app.mediaWAFError(lastErr)
+		}
 		if !app.accounts.HasAvailableFor(accountUsageImage) {
 			app.logWarn(ctx, "图片生成账号池已无可用账号", "attempt", attempt+1, "error", lastErr)
 			break
@@ -6281,8 +6458,14 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 	if generationChatType == "" {
 		generationChatType = "t2v"
 	}
-	attempts := app.mediaRetryAttempts()
+	if err := app.mediaWAFCircuitError(); err != nil {
+		return nil, err
+	}
+	attempts := app.mediaRetryAttempts(accountUsageVideo)
 	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		acc, err := app.accounts.AcquireFor(ctx, "", accountUsageVideo)
 		if err != nil {
 			app.logWarn(ctx, "视频生成获取账号失败", "attempt", attempt+1, "error", err)
@@ -6293,11 +6476,14 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer app.accounts.Release(acc)
 			setRequestLogFields(ctx, "account", acc.Email)
 			app.logInfo(ctx, "视频生成开始尝试", "attempt", attempt+1, "model", model, "chat_type", generationChatType)
-			chatID, err = app.client.CreateChat(ctx, acc.Token, model, generationChatType)
+			chatID, err = app.client.CreateChatForAccount(ctx, acc, model, generationChatType)
 			if err != nil {
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
 				app.logWarn(ctx, "视频生成创建会话失败", "attempt", attempt+1, "error", err)
+				if isUpstreamWAFErrorMessage(err.Error()) {
+					app.tripMediaWAFCircuit(err)
+				}
 				return
 			}
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
@@ -6322,6 +6508,9 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 					lastErr = err
 					app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 					app.logWarn(ctx, "视频生成首帧上传失败", "attempt", attempt+1, "error", err)
+					if isUpstreamWAFErrorMessage(err.Error()) {
+						app.tripMediaWAFCircuit(err)
+					}
 					return
 				}
 				if ref, ok := uploaded["remote_ref"].(map[string]any); ok {
@@ -6331,17 +6520,23 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 
 			payload := buildChatPayload(chatID, model, promptText, false, files, generationChatType, videoOptions, nil, false)
 			payload["stream"] = false
-			status, body, err := app.client.PostChatCompletionOnce(ctx, acc.Token, chatID, payload, 90*time.Second)
+			status, body, err := app.client.PostChatCompletionOnceForAccount(ctx, acc, chatID, payload, 90*time.Second)
 			if err != nil {
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
 				app.logWarn(ctx, "视频生成上游请求失败", "attempt", attempt+1, "error", err)
+				if isUpstreamWAFErrorMessage(err.Error()) {
+					app.tripMediaWAFCircuit(err)
+				}
 				return
 			}
 			if status != http.StatusOK {
 				lastErr = fmt.Errorf("video completion HTTP %d: %s", status, truncate(body, 500))
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageVideo)
 				app.logWarn(ctx, "视频生成上游状态异常", "attempt", attempt+1, "status", status, "body", truncate(body, 240))
+				if isUpstreamWAFErrorMessage(lastErr.Error()) {
+					app.tripMediaWAFCircuit(lastErr)
+				}
 				return
 			}
 			answerText := body
@@ -6349,6 +6544,9 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 				lastErr = fmt.Errorf("%s", failure)
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageVideo)
 				app.logWarn(ctx, "视频生成上游返回失败", "attempt", attempt+1, "failure", failure)
+				if isUpstreamWAFErrorMessage(failure) {
+					app.tripMediaWAFCircuit(lastErr)
+				}
 				return
 			}
 			urls := extractVideoURLs(answerText)
@@ -6356,18 +6554,21 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			app.logInfo(ctx, "视频生成初始结果解析", "attempt", attempt+1, "url_count", len(urls), "task_count", len(taskIDs))
 			if len(urls) == 0 && len(taskIDs) > 0 {
 				app.logInfo(ctx, "视频生成开始轮询任务", "task_id", taskIDs[0])
-				taskText, err := app.pollVideoTask(ctx, acc.Token, taskIDs[0], 7*time.Minute)
+				taskText, err := app.pollVideoTaskForAccount(ctx, acc, taskIDs[0], 7*time.Minute)
 				if err != nil {
 					lastErr = err
 					app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 					app.logWarn(ctx, "视频生成任务轮询失败", "task_id", taskIDs[0], "error", err)
+					if isUpstreamWAFErrorMessage(err.Error()) {
+						app.tripMediaWAFCircuit(err)
+					}
 					return
 				}
 				answerText += "\n" + taskText
 				urls = extractVideoURLs(answerText)
 			}
 			if len(urls) == 0 {
-				if _, detail, err := app.client.GetChatDetail(ctx, acc.Token, chatID, 30*time.Second); err == nil && detail != "" {
+				if _, detail, err := app.client.GetChatDetailForAccount(ctx, acc, chatID, 30*time.Second); err == nil && detail != "" {
 					answerText += "\n" + detail
 					urls = extractVideoURLs(answerText)
 				}
@@ -6388,6 +6589,9 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			}
 		}
 		app.logWarn(ctx, "视频生成尝试失败", "attempt", attempt+1, "error", lastErr)
+		if lastErr != nil && isUpstreamWAFErrorMessage(lastErr.Error()) {
+			return nil, app.mediaWAFError(lastErr)
+		}
 		if !app.accounts.HasAvailableFor(accountUsageVideo) {
 			app.logWarn(ctx, "视频生成账号池已无可用账号", "attempt", attempt+1, "error", lastErr)
 			break
@@ -6399,12 +6603,72 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 	return nil, fmt.Errorf("All %d attempts failed. Last error: %w", attempts, lastErr)
 }
 
-func (app *App) mediaRetryAttempts() int {
-	attempts := max(1, app.settings.MaxRetries)
-	if app != nil && app.accounts != nil {
-		attempts = max(attempts, len(app.accounts.Snapshot()))
+func (app *App) mediaRetryAttempts(usage string) int {
+	if app == nil {
+		return 1
 	}
-	return attempts
+	attempts := app.settings.MediaMaxRetries
+	switch normalizeAccountUsage(usage) {
+	case accountUsageImage:
+		if app.settings.ImageMaxRetries > 0 {
+			attempts = app.settings.ImageMaxRetries
+		}
+	case accountUsageVideo:
+		if app.settings.VideoMaxRetries > 0 {
+			attempts = app.settings.VideoMaxRetries
+		}
+	}
+	if attempts <= 0 {
+		attempts = app.settings.MaxRetries
+	}
+	return clampInt(attempts, 1, 20)
+}
+
+func (app *App) mediaWAFCircuitError() error {
+	if app == nil {
+		return nil
+	}
+	app.mediaWAFMu.Lock()
+	defer app.mediaWAFMu.Unlock()
+	if app.mediaWAFUntil.IsZero() || time.Now().After(app.mediaWAFUntil) {
+		return nil
+	}
+	return app.mediaWAFErrorLocked(nil)
+}
+
+func (app *App) tripMediaWAFCircuit(err error) {
+	if app == nil || app.settings.MediaWAFBreakerCooldownSeconds <= 0 {
+		return
+	}
+	app.mediaWAFMu.Lock()
+	defer app.mediaWAFMu.Unlock()
+	app.mediaWAFUntil = time.Now().Add(time.Duration(app.settings.MediaWAFBreakerCooldownSeconds) * time.Second)
+	if err != nil {
+		app.mediaWAFLastError = err.Error()
+	}
+}
+
+func (app *App) mediaWAFError(err error) error {
+	if app == nil {
+		return err
+	}
+	app.mediaWAFMu.Lock()
+	defer app.mediaWAFMu.Unlock()
+	return app.mediaWAFErrorLocked(err)
+}
+
+func (app *App) mediaWAFErrorLocked(err error) error {
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	if detail == "" {
+		detail = app.mediaWAFLastError
+	}
+	if app.mediaWAFUntil.After(time.Now()) {
+		return fmt.Errorf("upstream Qwen media request blocked by Aliyun WAF; circuit breaker active until %s. Last error: %s", app.mediaWAFUntil.Format(time.RFC3339), truncate(detail, 240))
+	}
+	return fmt.Errorf("upstream Qwen media request blocked by Aliyun WAF: %s", truncate(detail, 240))
 }
 
 func upstreamMediaErrorStatus(err error) int {
@@ -6412,6 +6676,9 @@ func upstreamMediaErrorStatus(err error) int {
 		return http.StatusInternalServerError
 	}
 	msg := err.Error()
+	if isUpstreamWAFErrorMessage(msg) {
+		return http.StatusBadGateway
+	}
 	if isRateLimitErrorMessage(msg) {
 		return http.StatusTooManyRequests
 	}
@@ -6422,11 +6689,21 @@ func upstreamMediaErrorStatus(err error) int {
 }
 
 func (app *App) pollVideoTask(ctx context.Context, token, taskID string, timeout time.Duration) (string, error) {
+	return app.pollVideoTaskForIdentity(ctx, qwenIdentityFromToken(token), taskID, timeout)
+}
+
+// pollVideoTaskForAccount 使用账号完整身份轮询视频任务，避免生成成功后状态查询被风控拦截。
+func (app *App) pollVideoTaskForAccount(ctx context.Context, acc *Account, taskID string, timeout time.Duration) (string, error) {
+	return app.pollVideoTaskForIdentity(ctx, qwenIdentityFromAccount(acc), taskID, timeout)
+}
+
+// pollVideoTaskForIdentity 轮询 Qwen 视觉任务直到成功、失败或超时。
+func (app *App) pollVideoTaskForIdentity(ctx context.Context, identity QwenRequestIdentity, taskID string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	snapshots := []string{}
 	lastStatus := ""
 	for time.Now().Before(deadline) {
-		status, body, err := app.client.GetVisionTaskStatus(ctx, token, taskID, 30*time.Second)
+		status, body, err := app.client.GetVisionTaskStatusForIdentity(ctx, identity, taskID, 30*time.Second)
 		if body != "" {
 			snapshots = append(snapshots, body)
 		}
@@ -6794,7 +7071,7 @@ func (app *App) adminAddAccount(w http.ResponseWriter, r *http.Request) {
 		Username:   stringValue(body, "username", ""),
 		StatusCode: "valid",
 	}
-	verify := app.client.VerifyTokenDetail(r.Context(), token)
+	verify := app.client.VerifyTokenDetailForAccount(r.Context(), &acc)
 	if !verify.Valid {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Invalid token (验证失败，请确认Token有效)", "status_code": verify.StatusCode, "detail": verify.Error})
 		return
@@ -6812,7 +7089,7 @@ func (app *App) adminVerifyAll(w http.ResponseWriter, r *http.Request) {
 	}
 	results := []map[string]any{}
 	for _, acc := range app.accounts.Snapshot() {
-		verify := app.client.VerifyTokenDetail(r.Context(), acc.Token)
+		verify := app.client.VerifyTokenDetailForAccount(r.Context(), &acc)
 		_ = app.accounts.MarkVerification(acc.Email, verify)
 		results = append(results, map[string]any{"email": acc.Email, "valid": verify.Valid, "status_code": verify.StatusCode, "error": verify.Error, "refreshed": false})
 	}
@@ -6848,8 +7125,9 @@ func (app *App) adminActivateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Account not found")
 		return
 	}
-	if target.Valid && target.Token != "" && !target.ActivationPending {
-		verify := app.client.VerifyTokenDetail(r.Context(), target.Token)
+	// 已有浏览器 Cookie 时才短路；Cookie 为空需要重新跑浏览器流程补齐 Baxia/AWSC 验证态。
+	if target.Valid && target.Token != "" && target.Cookies != "" && !target.ActivationPending {
+		verify := app.client.VerifyTokenDetailForAccount(r.Context(), target)
 		if verify.Valid {
 			_ = app.accounts.MarkVerification(target.Email, verify)
 			app.logInfo(r.Context(), "账号已激活，现有 token 验证通过", "account", email)
@@ -6886,7 +7164,7 @@ func (app *App) adminVerifyAccount(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
 	for _, acc := range app.accounts.Snapshot() {
 		if acc.Email == email {
-			verify := app.client.VerifyTokenDetail(r.Context(), acc.Token)
+			verify := app.client.VerifyTokenDetailForAccount(r.Context(), &acc)
 			_ = app.accounts.MarkVerification(acc.Email, verify)
 			writeJSON(w, http.StatusOK, map[string]any{"email": email, "valid": verify.Valid, "status_code": verify.StatusCode, "error": verify.Error, "refreshed": false})
 			return
@@ -8288,6 +8566,29 @@ type TokenVerifyResult struct {
 	Error      string
 }
 
+type QwenRequestIdentity struct {
+	Token   string
+	Cookies string
+	Email   string
+}
+
+// qwenIdentityFromToken 构造仅包含 Token 的上游请求身份，保留旧调用路径的兼容性。
+func qwenIdentityFromToken(token string) QwenRequestIdentity {
+	return QwenRequestIdentity{Token: strings.TrimSpace(token)}
+}
+
+// qwenIdentityFromAccount 从账号快照中提取 Token 和浏览器 Cookie，供 Qwen 风控态注入使用。
+func qwenIdentityFromAccount(acc *Account) QwenRequestIdentity {
+	if acc == nil {
+		return QwenRequestIdentity{}
+	}
+	return QwenRequestIdentity{
+		Token:   strings.TrimSpace(acc.Token),
+		Cookies: strings.TrimSpace(acc.Cookies),
+		Email:   strings.TrimSpace(acc.Email),
+	}
+}
+
 func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *QwenClient {
 	return &QwenClient{
 		pool: pool, settings: settings, logger: logger,
@@ -8305,22 +8606,42 @@ func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *Q
 }
 
 func qwenHeaders(token string) http.Header {
+	return qwenHeadersForIdentity(qwenIdentityFromToken(token))
+}
+
+// qwenHeadersForIdentity 统一生成 Qwen 上游请求头，并在账号带有 Cookie 时注入浏览器验证态。
+func qwenHeadersForIdentity(identity QwenRequestIdentity) http.Header {
 	h := http.Header{}
-	h.Set("Authorization", "Bearer "+token)
+	if identity.Token != "" {
+		h.Set("Authorization", "Bearer "+identity.Token)
+	}
 	h.Set("x-request-id", qwenRequestID())
-	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	// 贴近 Qwen Web 0.2.66 的请求指纹；旧版 Chrome 124 头会触发 Baxia completion 级校验。
+	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0")
 	h.Set("Accept", "application/json, text/plain, */*")
 	h.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	h.Set("Referer", qwenBaseURL+"/")
 	h.Set("Origin", qwenBaseURL)
 	h.Set("Connection", "keep-alive")
-	h.Set("sec-ch-ua", `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`)
+	h.Set("source", "web")
+	h.Set("version", "0.2.66")
+	h.Set("timezone", qwenWebTimezone())
+	h.Set("sec-ch-ua", `"Chromium";v="143", "Not A(Brand";v="24"`)
 	h.Set("sec-ch-ua-mobile", "?0")
 	h.Set("sec-ch-ua-platform", `"Windows"`)
 	h.Set("sec-fetch-dest", "empty")
 	h.Set("sec-fetch-mode", "cors")
 	h.Set("sec-fetch-site", "same-origin")
+	if identity.Cookies != "" {
+		// Qwen 的 Baxia/AWSC 验证态可能落在 Cookie 中，必须随同账号一起发送。
+		h.Set("Cookie", identity.Cookies)
+	}
 	return h
+}
+
+// qwenWebTimezone 生成与 Qwen Web 前端接近的 timezone 请求头。
+func qwenWebTimezone() string {
+	return time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000")
 }
 
 func qwenRequestID() string {
@@ -8338,6 +8659,16 @@ func qwenRequestID() string {
 }
 
 func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string, body any, timeout time.Duration) (int, string, error) {
+	return c.requestJSONForIdentity(ctx, method, path, qwenIdentityFromToken(token), body, timeout)
+}
+
+// requestJSONForAccount 使用账号上下文请求 Qwen，避免文件、媒体接口丢失账号 Cookie。
+func (c *QwenClient) requestJSONForAccount(ctx context.Context, method, path string, acc *Account, body any, timeout time.Duration) (int, string, error) {
+	return c.requestJSONForIdentity(ctx, method, path, qwenIdentityFromAccount(acc), body, timeout)
+}
+
+// requestJSONForIdentity 是 Qwen JSON 请求的唯一实现点，便于统一注入请求身份和日志字段。
+func (c *QwenClient) requestJSONForIdentity(ctx context.Context, method, path string, identity QwenRequestIdentity, body any, timeout time.Duration) (int, string, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -8355,21 +8686,21 @@ func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string
 	if err != nil {
 		return 0, "", err
 	}
-	req.Header = qwenHeaders(token)
+	req.Header = qwenHeadersForIdentity(identity)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	upstreamRequestID := req.Header.Get("x-request-id")
 	start := time.Now()
-	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(token), "upstream_request_id", upstreamRequestID)
+	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "upstream_request_id", upstreamRequestID)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(token), "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
+		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
 		return 0, err.Error(), err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	attrs := []any{"method", method, "path", path, "token", redactToken(token), "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "bytes", len(raw), "duration_ms", time.Since(start).Milliseconds()}
+	attrs := []any{"method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "bytes", len(raw), "duration_ms", time.Since(start).Milliseconds()}
 	if resp.StatusCode >= 400 {
 		attrs = append(attrs, "body", truncate(string(raw), 240))
 		logWarn(c.logger, ctx, "上游请求完成", attrs...)
@@ -8380,13 +8711,23 @@ func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string
 }
 
 func (c *QwenClient) CreateChat(ctx context.Context, token, model, chatType string) (string, error) {
+	return c.CreateChatForIdentity(ctx, qwenIdentityFromToken(token), model, chatType)
+}
+
+// CreateChatForAccount 使用账号完整身份创建会话，确保媒体和对话请求共享同一验证态。
+func (c *QwenClient) CreateChatForAccount(ctx context.Context, acc *Account, model, chatType string) (string, error) {
+	return c.CreateChatForIdentity(ctx, qwenIdentityFromAccount(acc), model, chatType)
+}
+
+// CreateChatForIdentity 调用 Qwen 创建会话接口，并识别 HTTP 200 风控页。
+func (c *QwenClient) CreateChatForIdentity(ctx context.Context, identity QwenRequestIdentity, model, chatType string) (string, error) {
 	if chatType == "" {
 		chatType = "t2t"
 	}
 	ts := time.Now().Unix()
 	body := map[string]any{"title": fmt.Sprintf("api_%d", ts), "models": []string{model}, "chat_mode": "normal", "chat_type": normalizeUpstreamChatType(chatType), "timestamp": ts}
-	logInfo(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(token))
-	status, text, err := c.requestJSON(ctx, http.MethodPost, "/api/v2/chats/new", token, body, 30*time.Second)
+	logInfo(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "")
+	status, text, err := c.requestJSONForIdentity(ctx, http.MethodPost, "/api/v2/chats/new", identity, body, 30*time.Second)
 	if err != nil {
 		logWarn(c.logger, ctx, "创建上游会话请求失败", "model", model, "chat_type", chatType, "error", err)
 		return "", err
@@ -8400,6 +8741,9 @@ func (c *QwenClient) CreateChat(ctx context.Context, token, model, chatType stri
 			return "", errors.New("429 Too Many Requests")
 		}
 		return "", fmt.Errorf("create_chat HTTP %d: %s", status, truncate(text, 200))
+	}
+	if isUpstreamWAFErrorMessage(text) {
+		return "", fmt.Errorf("create_chat blocked by Aliyun WAF: %s", truncate(text, 200))
 	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
@@ -8440,6 +8784,16 @@ func (c *QwenClient) DeleteChat(ctx context.Context, token, chatID string) bool 
 }
 
 func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, payload map[string]any, onEvent func(UpstreamEvent) error) error {
+	return c.StreamChatForIdentity(ctx, qwenIdentityFromToken(token), chatID, payload, onEvent)
+}
+
+// StreamChatForAccount 使用账号完整身份发起流式会话请求。
+func (c *QwenClient) StreamChatForAccount(ctx context.Context, acc *Account, chatID string, payload map[string]any, onEvent func(UpstreamEvent) error) error {
+	return c.StreamChatForIdentity(ctx, qwenIdentityFromAccount(acc), chatID, payload, onEvent)
+}
+
+// StreamChatForIdentity 是 Qwen SSE 请求的唯一实现点，集中处理 HTML/WAF 响应和超时。
+func (c *QwenClient) StreamChatForIdentity(ctx context.Context, identity QwenRequestIdentity, chatID string, payload map[string]any, onEvent func(UpstreamEvent) error) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -8450,11 +8804,12 @@ func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, paylo
 	if err != nil {
 		return err
 	}
-	req.Header = qwenHeaders(token)
+	req.Header = qwenHeadersForIdentity(identity)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("X-Accel-Buffering", "no")
 	upstreamRequestID := req.Header.Get("x-request-id")
-	logInfo(c.logger, ctx, "开始上游流式请求", "chat_id", chatID, "token", redactToken(token), "upstream_request_id", upstreamRequestID, "payload_bytes", len(raw))
+	logInfo(c.logger, ctx, "开始上游流式请求", "chat_id", chatID, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "upstream_request_id", upstreamRequestID, "payload_bytes", len(raw))
 	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -8466,6 +8821,14 @@ func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, paylo
 		body, _ := io.ReadAll(resp.Body)
 		logWarn(c.logger, ctx, "上游流式返回错误", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body", truncate(string(body), 240))
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 800))
+	}
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+		body, _ := io.ReadAll(resp.Body)
+		logWarn(c.logger, ctx, "上游流式返回 HTML", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body", truncate(string(body), 240))
+		if isUpstreamWAFErrorMessage(string(body)) {
+			return fmt.Errorf("stream_chat blocked by Aliyun WAF: %s", truncate(string(body), 200))
+		}
+		return fmt.Errorf("stream_chat unexpected HTML response: %s", truncate(string(body), 200))
 	}
 	firstEventTimeout := streamTimeoutDuration(c.settings.UpstreamStreamFirstEventTimeoutSeconds)
 	idleTimeout := streamTimeoutDuration(c.settings.UpstreamStreamIdleTimeoutSeconds)
@@ -8567,6 +8930,9 @@ func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, paylo
 							return errors.New(upstreamError)
 						}
 						logWarn(c.logger, ctx, "上游 SSE 未解析到有效 delta", "chat_id", chatID, "stream_bytes", totalBytes, "raw_tail", truncate(rawTail, 500))
+						if isUpstreamWAFErrorMessage(rawTail) {
+							return fmt.Errorf("stream_chat blocked by Aliyun WAF: %s", truncate(rawTail, 200))
+						}
 					}
 					return nil
 				}
@@ -8587,6 +8953,16 @@ func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, paylo
 }
 
 func (c *QwenClient) PostChatCompletionOnce(ctx context.Context, token, chatID string, payload map[string]any, timeout time.Duration) (int, string, error) {
+	return c.PostChatCompletionOnceForIdentity(ctx, qwenIdentityFromToken(token), chatID, payload, timeout)
+}
+
+// PostChatCompletionOnceForAccount 使用账号完整身份发起非流式媒体生成请求。
+func (c *QwenClient) PostChatCompletionOnceForAccount(ctx context.Context, acc *Account, chatID string, payload map[string]any, timeout time.Duration) (int, string, error) {
+	return c.PostChatCompletionOnceForIdentity(ctx, qwenIdentityFromAccount(acc), chatID, payload, timeout)
+}
+
+// PostChatCompletionOnceForIdentity 是非流式 completion 的唯一实现点，便于统一识别风控响应。
+func (c *QwenClient) PostChatCompletionOnceForIdentity(ctx context.Context, identity QwenRequestIdentity, chatID string, payload map[string]any, timeout time.Duration) (int, string, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -8600,10 +8976,10 @@ func (c *QwenClient) PostChatCompletionOnce(ctx context.Context, token, chatID s
 	if err != nil {
 		return 0, "", err
 	}
-	req.Header = qwenHeaders(token)
+	req.Header = qwenHeadersForIdentity(identity)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Accel-Buffering", "no")
-	logInfo(c.logger, ctx, "开始上游非流式请求", "chat_id", chatID, "token", redactToken(token), "payload_bytes", len(raw))
+	logInfo(c.logger, ctx, "开始上游非流式请求", "chat_id", chatID, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "payload_bytes", len(raw))
 	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -8619,25 +8995,58 @@ func (c *QwenClient) PostChatCompletionOnce(ctx context.Context, token, chatID s
 	} else {
 		logInfo(c.logger, ctx, "上游非流式请求完成", attrs...)
 	}
+	if resp.StatusCode == http.StatusOK && isUpstreamWAFErrorMessage(string(body)) {
+		return resp.StatusCode, string(body), fmt.Errorf("chat completion blocked by Aliyun WAF: %s", truncate(string(body), 200))
+	}
 	return resp.StatusCode, string(body), nil
 }
 
 func (c *QwenClient) GetVisionTaskStatus(ctx context.Context, token, taskID string, timeout time.Duration) (int, string, error) {
+	return c.GetVisionTaskStatusForIdentity(ctx, qwenIdentityFromToken(token), taskID, timeout)
+}
+
+// GetVisionTaskStatusForAccount 使用账号完整身份查询视频任务，避免轮询阶段丢失验证态。
+func (c *QwenClient) GetVisionTaskStatusForAccount(ctx context.Context, acc *Account, taskID string, timeout time.Duration) (int, string, error) {
+	return c.GetVisionTaskStatusForIdentity(ctx, qwenIdentityFromAccount(acc), taskID, timeout)
+}
+
+// GetVisionTaskStatusForIdentity 查询 Qwen 视觉任务状态。
+func (c *QwenClient) GetVisionTaskStatusForIdentity(ctx context.Context, identity QwenRequestIdentity, taskID string, timeout time.Duration) (int, string, error) {
 	logInfo(c.logger, ctx, "查询上游视觉任务", "task_id", taskID)
-	return c.requestJSON(ctx, http.MethodGet, "/api/v1/tasks/status/"+taskID, token, nil, timeout)
+	return c.requestJSONForIdentity(ctx, http.MethodGet, "/api/v1/tasks/status/"+taskID, identity, nil, timeout)
 }
 
 func (c *QwenClient) GetChatDetail(ctx context.Context, token, chatID string, timeout time.Duration) (int, string, error) {
+	return c.GetChatDetailForIdentity(ctx, qwenIdentityFromToken(token), chatID, timeout)
+}
+
+// GetChatDetailForAccount 使用账号完整身份查询会话详情。
+func (c *QwenClient) GetChatDetailForAccount(ctx context.Context, acc *Account, chatID string, timeout time.Duration) (int, string, error) {
+	return c.GetChatDetailForIdentity(ctx, qwenIdentityFromAccount(acc), chatID, timeout)
+}
+
+// GetChatDetailForIdentity 查询 Qwen 会话详情。
+func (c *QwenClient) GetChatDetailForIdentity(ctx context.Context, identity QwenRequestIdentity, chatID string, timeout time.Duration) (int, string, error) {
 	logInfo(c.logger, ctx, "查询上游会话详情", "chat_id", chatID)
-	return c.requestJSON(ctx, http.MethodGet, "/api/v2/chats/"+chatID, token, nil, timeout)
+	return c.requestJSONForIdentity(ctx, http.MethodGet, "/api/v2/chats/"+chatID, identity, nil, timeout)
 }
 
 func (c *QwenClient) ListChats(ctx context.Context, token string, limit int) ([]map[string]any, error) {
+	return c.ListChatsForIdentity(ctx, qwenIdentityFromToken(token), limit)
+}
+
+// ListChatsForAccount 使用账号完整身份查询会话列表。
+func (c *QwenClient) ListChatsForAccount(ctx context.Context, acc *Account, limit int) ([]map[string]any, error) {
+	return c.ListChatsForIdentity(ctx, qwenIdentityFromAccount(acc), limit)
+}
+
+// ListChatsForIdentity 查询 Qwen 会话列表并解析为通用 map 列表。
+func (c *QwenClient) ListChatsForIdentity(ctx context.Context, identity QwenRequestIdentity, limit int) ([]map[string]any, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	logInfo(c.logger, ctx, "查询上游会话列表", "limit", limit)
-	status, text, err := c.requestJSON(ctx, http.MethodGet, fmt.Sprintf("/api/v2/chats?limit=%d", limit), token, nil, 20*time.Second)
+	status, text, err := c.requestJSONForIdentity(ctx, http.MethodGet, fmt.Sprintf("/api/v2/chats?limit=%d", limit), identity, nil, 20*time.Second)
 	if err != nil {
 		logWarn(c.logger, ctx, "查询上游会话列表失败", "limit", limit, "error", err)
 		return nil, err
@@ -8694,19 +9103,34 @@ func (c *QwenClient) VerifyToken(ctx context.Context, token string) bool {
 }
 
 func (c *QwenClient) VerifyTokenDetail(ctx context.Context, token string) TokenVerifyResult {
-	if strings.TrimSpace(token) == "" {
+	return c.VerifyTokenDetailForIdentity(ctx, qwenIdentityFromToken(token))
+}
+
+// VerifyTokenDetailForAccount 使用账号完整身份验证 token，避免 Cookie 验证态丢失导致误判。
+func (c *QwenClient) VerifyTokenDetailForAccount(ctx context.Context, acc *Account) TokenVerifyResult {
+	return c.VerifyTokenDetailForIdentity(ctx, qwenIdentityFromAccount(acc))
+}
+
+// VerifyTokenDetailForIdentity 查询 Qwen 用户信息，用于判断账号 token 是否仍有效。
+func (c *QwenClient) VerifyTokenDetailForIdentity(ctx context.Context, identity QwenRequestIdentity) TokenVerifyResult {
+	if strings.TrimSpace(identity.Token) == "" {
 		logWarn(c.logger, ctx, "账号 Token 验证失败", "status_code", "auth_error", "error", "empty token")
 		return TokenVerifyResult{StatusCode: "auth_error", Error: "empty token"}
 	}
-	logInfo(c.logger, ctx, "开始账号 Token 验证", "token", redactToken(token))
-	status, text, err := c.requestJSON(ctx, http.MethodGet, "/api/v2/user/info", token, nil, 20*time.Second)
+	logInfo(c.logger, ctx, "开始账号 Token 验证", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "")
+	status, text, err := c.requestJSONForIdentity(ctx, http.MethodGet, "/api/v2/user/info", identity, nil, 20*time.Second)
 	if err != nil {
-		logWarn(c.logger, ctx, "账号 Token 验证请求失败", "token", redactToken(token), "error", err)
+		logWarn(c.logger, ctx, "账号 Token 验证请求失败", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "error", err)
 		return TokenVerifyResult{StatusCode: "network_error", Error: err.Error()}
 	}
 	lower := strings.ToLower(text)
+	if isUpstreamWAFErrorMessage(text) {
+		result := TokenVerifyResult{StatusCode: "network_error", Error: fmt.Sprintf("WAF blocked: %s", truncate(text, 200))}
+		logWarn(c.logger, ctx, "账号 Token 验证被上游 WAF 拦截", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status, "body", truncate(text, 240))
+		return result
+	}
 	if status >= 200 && status < 300 && !strings.Contains(lower, "unauthorized") {
-		logInfo(c.logger, ctx, "账号 Token 验证通过", "token", redactToken(token), "status", status)
+		logInfo(c.logger, ctx, "账号 Token 验证通过", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status)
 		return TokenVerifyResult{Valid: true, StatusCode: "valid"}
 	}
 	statusCode := "invalid"
@@ -8719,7 +9143,7 @@ func (c *QwenClient) VerifyTokenDetail(ctx context.Context, token string) TokenV
 		statusCode = "banned"
 	}
 	result := TokenVerifyResult{StatusCode: statusCode, Error: fmt.Sprintf("HTTP %d: %s", status, truncate(text, 200))}
-	logWarn(c.logger, ctx, "账号 Token 验证失败", "token", redactToken(token), "status", status, "status_code", statusCode, "body", truncate(text, 240))
+	logWarn(c.logger, ctx, "账号 Token 验证失败", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status, "status_code", statusCode, "body", truncate(text, 240))
 	return result
 }
 
