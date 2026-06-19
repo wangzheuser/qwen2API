@@ -66,6 +66,10 @@ type App struct {
 	keepalive         *KeepAliveService
 	videoTasks        map[string]*VideoTask
 	videoTasksMu      sync.RWMutex
+	mediaSlots        chan struct{}
+	mediaPaceMu       sync.Mutex
+	lastMediaStarted  time.Time
+	mediaRefreshMu    sync.Mutex
 	mediaWAFMu        sync.Mutex
 	mediaWAFUntil     time.Time
 	mediaWAFLastError string
@@ -165,6 +169,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 		sessionStore:      NewJSONStore(settings.ContextAffinityFile, []any{}),
 		fileContentCache:  newFileContentCache(),
 		videoTasks:        map[string]*VideoTask{},
+		mediaSlots:        make(chan struct{}, maxInt(settings.MediaMaxConcurrency, 1)),
 	}
 
 	app.apiKeys, app.managedAPIKeys, app.envAPIKeys = loadAPIKeys(settings.APIKeysFile, logger)
@@ -461,6 +466,46 @@ func (p *AccountPool) HasAvailableFor(usage string) bool {
 	return false
 }
 
+// HasCookieBackedAvailableFor 判断媒体请求是否还有带浏览器验证态的可用账号。
+func (p *AccountPool) HasCookieBackedAvailableFor(usage string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.globalMaxInflight > 0 && p.globalInUse >= p.globalMaxInflight {
+		return false
+	}
+	for _, acc := range p.accounts {
+		if strings.TrimSpace(acc.Cookies) == "" {
+			continue
+		}
+		if acc.availableFor(p.settings, usage) && acc.Inflight < p.maxInflightPerAccount {
+			return true
+		}
+	}
+	return false
+}
+
+// CookieRefreshCandidates 返回可尝试刷新浏览器 Cookie 的 token-only 账号快照。
+func (p *AccountPool) CookieRefreshCandidates(limit int) []Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if limit <= 0 {
+		limit = 1
+	}
+	out := make([]Account, 0, limit)
+	for _, acc := range p.accounts {
+		if acc == nil || !acc.Valid || acc.Token == "" || strings.TrimSpace(acc.Cookies) != "" || acc.ActivationPending {
+			continue
+		}
+		cp := *acc
+		cp.RateLimits = cloneRateLimits(acc.RateLimits)
+		out = append(out, cp)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 func (p *AccountPool) Add(acc Account) error {
 	acc.normalize()
 	p.mu.Lock()
@@ -552,11 +597,41 @@ func (p *AccountPool) AcquireFor(ctx context.Context, preferredEmail, usage stri
 	}
 }
 
+// AcquireCookieBackedFor 获取带浏览器 Cookie 验证态的账号，供媒体类 Qwen 请求使用。
+func (p *AccountPool) AcquireCookieBackedFor(ctx context.Context, preferredEmail, usage string) (*Account, error) {
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		p.mu.Lock()
+		acc := p.pickLockedForOptions(preferredEmail, usage, true)
+		if acc != nil {
+			now := float64(time.Now().UnixNano()) / 1e9
+			acc.Inflight++
+			acc.LastRequestStarted = now
+			p.globalInUse++
+			p.mu.Unlock()
+			return acc, nil
+		}
+		p.mu.Unlock()
+		if time.Now().After(deadline) {
+			return nil, errors.New("no available upstream account with Qwen browser cookie")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
 func (p *AccountPool) pickLocked(preferredEmail string) *Account {
 	return p.pickLockedFor(preferredEmail, accountUsageChat)
 }
 
 func (p *AccountPool) pickLockedFor(preferredEmail, usage string) *Account {
+	return p.pickLockedForOptions(preferredEmail, usage, false)
+}
+
+func (p *AccountPool) pickLockedForOptions(preferredEmail, usage string, requireCookies bool) *Account {
 	if p.globalMaxInflight > 0 && p.globalInUse >= p.globalMaxInflight {
 		return nil
 	}
@@ -568,10 +643,13 @@ func (p *AccountPool) pickLockedFor(preferredEmail, usage string) *Account {
 		if !acc.availableFor(p.settings, usage) || acc.Inflight >= p.maxInflightPerAccount {
 			continue
 		}
+		if requireCookies && strings.TrimSpace(acc.Cookies) == "" {
+			continue
+		}
 		candidates = append(candidates, acc)
 	}
 	if preferredEmail != "" && len(candidates) == 0 {
-		return p.pickLockedFor("", usage)
+		return p.pickLockedForOptions("", usage, requireCookies)
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -1889,6 +1967,10 @@ type Settings struct {
 	MediaMaxRetries                        int
 	ImageMaxRetries                        int
 	VideoMaxRetries                        int
+	MediaMaxConcurrency                    int
+	MediaMinIntervalMS                     int
+	MediaCookieRefreshBatch                int
+	VideoTaskTimeoutSeconds                int
 	MediaWAFBreakerCooldownSeconds         int
 	ToolRecoveryMaxAttempts                int
 	RateLimitCooldown                      int
@@ -1955,6 +2037,10 @@ func LoadSettings() Settings {
 		MediaMaxRetries:                        envInt("MEDIA_MAX_RETRIES", maxRetries),
 		ImageMaxRetries:                        envInt("IMAGE_MAX_RETRIES", 0),
 		VideoMaxRetries:                        envInt("VIDEO_MAX_RETRIES", 0),
+		MediaMaxConcurrency:                    envInt("MEDIA_MAX_CONCURRENCY", 1),
+		MediaMinIntervalMS:                     envInt("MEDIA_MIN_INTERVAL_MS", 8000),
+		MediaCookieRefreshBatch:                envInt("MEDIA_COOKIE_REFRESH_BATCH", 3),
+		VideoTaskTimeoutSeconds:                envInt("VIDEO_TASK_TIMEOUT_SECONDS", 1800),
 		MediaWAFBreakerCooldownSeconds:         envInt("MEDIA_WAF_BREAKER_COOLDOWN_SECONDS", 600),
 		ToolRecoveryMaxAttempts:                clampInt(envInt("TOOL_RECOVERY_MAX_ATTEMPTS", 4), 1, 8),
 		RateLimitCooldown:                      600,
@@ -2519,10 +2605,12 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /embeddings", app.handleEmbeddings)
 	mux.HandleFunc("POST /v1/images/generations", app.handleImages)
 	mux.HandleFunc("POST /images/generations", app.handleImages)
+	mux.HandleFunc("GET /v1/images/tasks/{task_id}", app.handleMediaTask)
+	mux.HandleFunc("GET /images/tasks/{task_id}", app.handleMediaTask)
 	mux.HandleFunc("POST /v1/videos/generations", app.handleVideos)
 	mux.HandleFunc("POST /videos/generations", app.handleVideos)
-	mux.HandleFunc("GET /v1/videos/tasks/{task_id}", app.handleVideoTask)
-	mux.HandleFunc("GET /videos/tasks/{task_id}", app.handleVideoTask)
+	mux.HandleFunc("GET /v1/videos/tasks/{task_id}", app.handleMediaTask)
+	mux.HandleFunc("GET /videos/tasks/{task_id}", app.handleMediaTask)
 	mux.HandleFunc("POST /v1/files", app.handleUploadFile)
 	mux.HandleFunc("POST /api/files/upload", app.handleUploadFile)
 	mux.HandleFunc("DELETE /v1/files/{file_id}", app.handleDeleteFile)
@@ -4508,8 +4596,12 @@ func (app *App) classifyAccountErrorFor(acc *Account, err error, usage string) {
 		return
 	}
 	if isUpstreamWAFErrorMessage(lower) {
+		normalizedUsage := normalizeAccountUsage(usage)
+		if normalizedUsage == accountUsageImage || normalizedUsage == accountUsageVideo {
+			app.accounts.MarkRateLimitedFor(acc, normalizedUsage, app.settings.MediaWAFBreakerCooldownSeconds, msg)
+		}
 		if app.logger != nil {
-			app.logger.Warn("上游 WAF 风控拦截，未标记账号失效", "account", acc.Email, "usage", normalizeAccountUsage(usage), "error", truncate(msg, 240))
+			app.logger.Warn("上游 WAF 风控拦截，账号进入分用途冷却", "account", acc.Email, "usage", normalizedUsage, "error", truncate(msg, 240))
 		}
 		return
 	}
@@ -5934,7 +6026,8 @@ func (app *App) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -5956,11 +6049,40 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 	promptText := "请调用图片生成能力直接生成图片，不要只输出文字描述。如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n" +
 		"强制画布尺寸：" + size + " 像素。强制宽高比：" + ratio + "。必须严格按这个尺寸和比例生成，不要裁切成其它比例，不要改成默认尺寸。\n\n用户需求：" + prompt
 
-	urls, lastErr := app.createImageURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height})
+	requestData := map[string]any{
+		"prompt": prompt, "prompt_text": promptText, "model": model, "requested_model": stringValue(body, "model", ""),
+		"n": n, "size": size, "ratio": ratio, "width": width, "height": height,
+	}
+	if b := coerceBool(body["async"]); b != nil && *b {
+		// 高并发图片请求建议使用异步任务，避免客户端或入口代理等待上游排队导致超时。
+		task := app.createMediaTask(accountUsageImage, hashVideoTaskOwner(auth.Token), requestData)
+		go app.runImageTask(task.ID)
+		writeJSON(w, http.StatusAccepted, videoTaskResponse(task))
+		return
+	}
+
+	result, lastErr := app.generateImageData(r.Context(), requestData)
 	if lastErr != nil {
 		app.logWarn(r.Context(), "图片生成失败", "error", lastErr)
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// generateImageData 复用同步和异步图片生成逻辑。
+func (app *App) generateImageData(ctx context.Context, requestData map[string]any) (map[string]any, error) {
+	prompt := stringValue(requestData, "prompt", "")
+	promptText := stringValue(requestData, "prompt_text", prompt)
+	model := stringValue(requestData, "model", "")
+	n := min(max(1, intValue(requestData, "n", 1)), 4)
+	size := stringValue(requestData, "size", "1328x1328")
+	ratio := stringValue(requestData, "ratio", "1:1")
+	width := intValue(requestData, "width", 1328)
+	height := intValue(requestData, "height", 1328)
+	urls, err := app.createImageURLs(ctx, model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height})
+	if err != nil {
+		return nil, err
 	}
 	data := []map[string]any{}
 	for i, url := range urls {
@@ -5970,12 +6092,11 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 		data = append(data, map[string]any{"url": url, "revised_prompt": prompt, "size": size, "ratio": ratio, "width": width, "height": height})
 	}
 	if len(data) == 0 {
-		app.logWarn(r.Context(), "图片生成没有可返回的图片链接", "url_count", len(urls))
-		writeError(w, http.StatusInternalServerError, "Image generation produced no image URL")
-		return
+		app.logWarn(ctx, "图片生成没有可返回的图片链接", "url_count", len(urls))
+		return nil, fmt.Errorf("Image generation produced no image URL")
 	}
-	app.logInfo(r.Context(), "图片生成完成", "returned", len(data))
-	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+	app.logInfo(ctx, "图片生成完成", "returned", len(data))
+	return map[string]any{"created": time.Now().Unix(), "data": data}, nil
 }
 
 func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any) ([]string, error) {
@@ -5983,12 +6104,28 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 	if err := app.mediaWAFCircuitError(); err != nil {
 		return nil, err
 	}
+	releaseMediaSlot, err := app.acquireMediaSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMediaSlot()
+	if err := app.waitMediaPace(ctx); err != nil {
+		return nil, err
+	}
 	attempts := app.mediaRetryAttempts(accountUsageImage)
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		acc, err := app.accounts.AcquireFor(ctx, "", accountUsageImage)
+		if !app.accounts.HasCookieBackedAvailableFor(accountUsageImage) {
+			_ = app.ensureMediaCookieAccount(ctx, accountUsageImage)
+		}
+		acc, err := app.accounts.AcquireCookieBackedFor(ctx, "", accountUsageImage)
+		if err != nil {
+			if app.ensureMediaCookieAccount(ctx, accountUsageImage) {
+				acc, err = app.accounts.AcquireCookieBackedFor(ctx, "", accountUsageImage)
+			}
+		}
 		if err != nil {
 			app.logWarn(ctx, "图片生成获取账号失败", "attempt", attempt+1, "error", err)
 			return nil, err
@@ -6003,9 +6140,6 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				app.classifyAccountErrorFor(acc, err, accountUsageImage)
 				lastErr = err
 				app.logWarn(ctx, "图片生成创建会话失败", "attempt", attempt+1, "error", err)
-				if isUpstreamWAFErrorMessage(err.Error()) {
-					app.tripMediaWAFCircuit(err)
-				}
 				return
 			}
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
@@ -6025,9 +6159,6 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				app.classifyAccountErrorFor(acc, err, accountUsageImage)
 				lastErr = err
 				app.logWarn(ctx, "图片生成上游流式失败", "attempt", attempt+1, "error", err, "parts", len(parts))
-				if isUpstreamWAFErrorMessage(err.Error()) {
-					app.tripMediaWAFCircuit(err)
-				}
 				return
 			}
 
@@ -6047,9 +6178,6 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				lastErr = fmt.Errorf("%s", failure)
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageImage)
 				app.logWarn(ctx, "图片生成上游返回失败", "attempt", attempt+1, "failure", failure)
-				if isUpstreamWAFErrorMessage(failure) {
-					app.tripMediaWAFCircuit(lastErr)
-				}
 				return
 			}
 
@@ -6071,11 +6199,18 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			}
 		}
 		app.logWarn(ctx, "图片生成尝试失败", "attempt", attempt+1, "error", lastErr)
-		if lastErr != nil && isUpstreamWAFErrorMessage(lastErr.Error()) {
-			return nil, app.mediaWAFError(lastErr)
+		if shouldSwitchMediaAccount(lastErr) {
+			if app.accounts.HasCookieBackedAvailableFor(accountUsageImage) || app.ensureMediaCookieAccount(ctx, accountUsageImage) {
+				attempts = min(attempts+1, 20)
+				continue
+			}
 		}
-		if !app.accounts.HasAvailableFor(accountUsageImage) {
-			app.logWarn(ctx, "图片生成账号池已无可用账号", "attempt", attempt+1, "error", lastErr)
+		if !app.accounts.HasCookieBackedAvailableFor(accountUsageImage) {
+			if app.ensureMediaCookieAccount(ctx, accountUsageImage) {
+				attempts = min(attempts+1, 20)
+				continue
+			}
+			app.logWarn(ctx, "图片生成账号池已无可用 Cookie 账号", "attempt", attempt+1, "error", lastErr)
 			break
 		}
 	}
@@ -6088,6 +6223,7 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 const (
 	videoTaskTTLSeconds     = 24 * 60 * 60
 	videoFirstFrameMaxBytes = 20 * 1024 * 1024
+	imageTaskObjectType     = "image.generation.task"
 	videoTaskObjectType     = "video.generation.task"
 	defaultT2VModel         = "qwen3.6-plus"
 	defaultI2VModel         = "qwen3.7-plus"
@@ -6102,6 +6238,7 @@ type VideoTask struct {
 	Request   map[string]any `json:"request"`
 	Result    map[string]any `json:"result,omitempty"`
 	Error     map[string]any `json:"error,omitempty"`
+	Kind      string         `json:"kind"`
 	Mode      string         `json:"mode"`
 	Model     string         `json:"model"`
 	Created   int64          `json:"created"`
@@ -6134,16 +6271,26 @@ func videoTaskResponse(task *VideoTask) map[string]any {
 	if task == nil {
 		return map[string]any{}
 	}
+	kind := firstNonEmpty(task.Kind, accountUsageVideo)
+	pollPrefix := "/v1/videos/tasks/"
+	if kind == accountUsageImage {
+		pollPrefix = "/v1/images/tasks/"
+	}
 	out := map[string]any{
 		"id":       task.ID,
 		"object":   task.Object,
 		"status":   task.Status,
+		"kind":     kind,
 		"model":    task.Model,
 		"mode":     task.Mode,
 		"created":  task.Created,
 		"updated":  task.Updated,
 		"expires":  task.Expires,
-		"poll_url": "/v1/videos/tasks/" + task.ID,
+		"poll_url": pollPrefix + task.ID,
+	}
+	if task.Status == "queued" || task.Status == "running" {
+		// 提示客户端降低轮询频率，避免局部高并发任务查询放大服务负载。
+		out["retry_after"] = 10
 	}
 	if task.Started > 0 {
 		out["started"] = task.Started
@@ -6161,15 +6308,26 @@ func videoTaskResponse(task *VideoTask) map[string]any {
 	return out
 }
 
-// createVideoTask 创建内存任务并记录原始生成参数。
-func (app *App) createVideoTask(ownerHash string, requestData map[string]any) *VideoTask {
+// createMediaTask 创建内存媒体任务并记录原始生成参数。
+func (app *App) createMediaTask(kind, ownerHash string, requestData map[string]any) *VideoTask {
 	now := time.Now().Unix()
+	kind = normalizeAccountUsage(kind)
+	if kind != accountUsageImage {
+		kind = accountUsageVideo
+	}
+	objectType := videoTaskObjectType
+	idPrefix := "video_task_"
+	if kind == accountUsageImage {
+		objectType = imageTaskObjectType
+		idPrefix = "image_task_"
+	}
 	task := &VideoTask{
-		ID:        "video_task_" + randomID(),
-		Object:    videoTaskObjectType,
+		ID:        idPrefix + randomID(),
+		Object:    objectType,
 		OwnerHash: ownerHash,
 		Status:    "queued",
 		Request:   copyMapAny(requestData),
+		Kind:      kind,
 		Mode:      stringValue(requestData, "generation_chat_type", "t2v"),
 		Model:     stringValue(requestData, "model", ""),
 		Created:   now,
@@ -6212,6 +6370,40 @@ func (app *App) updateVideoTask(taskID string, mutate func(task *VideoTask)) {
 	task.Updated = time.Now().Unix()
 }
 
+// runImageTask 在后台执行图片生成，并把终态写回任务表。
+func (app *App) runImageTask(taskID string) {
+	app.updateVideoTask(taskID, func(task *VideoTask) {
+		if task.Status == "queued" {
+			task.Status = "running"
+			task.Started = time.Now().Unix()
+		}
+	})
+	task, ok := app.getVideoTask(taskID, "")
+	if !ok {
+		return
+	}
+	timeoutSeconds := maxInt(app.settings.VideoTaskTimeoutSeconds, 600)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+	result, err := app.generateImageData(ctx, task.Request)
+	if err != nil {
+		app.updateVideoTask(taskID, func(task *VideoTask) {
+			task.Status = "failed"
+			task.Error = map[string]any{"code": "image_generation_failed", "message": sanitizeVideoTaskError(err)}
+			task.Finished = time.Now().Unix()
+		})
+		app.logWarn(ctx, "异步图片任务失败", "task_id", taskID, "error", err)
+		return
+	}
+	app.updateVideoTask(taskID, func(task *VideoTask) {
+		task.Status = "succeeded"
+		task.Result = result
+		task.Error = nil
+		task.Finished = time.Now().Unix()
+	})
+	app.logInfo(ctx, "异步图片任务完成", "task_id", taskID)
+}
+
 // runVideoTask 在后台执行视频生成，并把终态写回任务表。
 func (app *App) runVideoTask(taskID string) {
 	app.updateVideoTask(taskID, func(task *VideoTask) {
@@ -6224,7 +6416,8 @@ func (app *App) runVideoTask(taskID string) {
 	if !ok {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	timeoutSeconds := maxInt(app.settings.VideoTaskTimeoutSeconds, 600)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 	result, err := app.generateVideoData(ctx, task.Request)
 	if err != nil {
@@ -6261,8 +6454,8 @@ func sanitizeVideoTaskError(err error) string {
 	return truncate(text, 500)
 }
 
-// handleVideoTask 查询异步视频任务状态和最终生成结果。
-func (app *App) handleVideoTask(w http.ResponseWriter, r *http.Request) {
+// handleMediaTask 查询异步图片/视频任务状态和最终生成结果。
+func (app *App) handleMediaTask(w http.ResponseWriter, r *http.Request) {
 	auth, ok := app.resolveAuth(w, r)
 	if !ok {
 		return
@@ -6274,13 +6467,13 @@ func (app *App) handleVideoTask(w http.ResponseWriter, r *http.Request) {
 	}
 	task, found := app.getVideoTask(taskID, hashVideoTaskOwner(auth.Token))
 	if !found {
-		writeError(w, http.StatusNotFound, "Video task not found")
+		writeError(w, http.StatusNotFound, "Media task not found")
 		return
 	}
 	if task.Expires > 0 && time.Now().Unix() > task.Expires && (task.Status == "queued" || task.Status == "running") {
 		app.updateVideoTask(taskID, func(task *VideoTask) {
 			task.Status = "expired"
-			task.Error = map[string]any{"code": "expired", "message": "Video task expired"}
+			task.Error = map[string]any{"code": "expired", "message": "Media task expired"}
 			task.Finished = time.Now().Unix()
 		})
 		task, _ = app.getVideoTask(taskID, hashVideoTaskOwner(auth.Token))
@@ -6336,7 +6529,7 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 	}
 	if b := coerceBool(body["async"]); b != nil && *b {
 		// 异步分支立即返回任务 ID，后台 goroutine 继续复用同一生成逻辑。
-		task := app.createVideoTask(hashVideoTaskOwner(auth.Token), requestData)
+		task := app.createMediaTask(accountUsageVideo, hashVideoTaskOwner(auth.Token), requestData)
 		go app.runVideoTask(task.ID)
 		writeJSON(w, http.StatusAccepted, videoTaskResponse(task))
 		return
@@ -6461,12 +6654,28 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 	if err := app.mediaWAFCircuitError(); err != nil {
 		return nil, err
 	}
+	releaseMediaSlot, err := app.acquireMediaSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMediaSlot()
+	if err := app.waitMediaPace(ctx); err != nil {
+		return nil, err
+	}
 	attempts := app.mediaRetryAttempts(accountUsageVideo)
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		acc, err := app.accounts.AcquireFor(ctx, "", accountUsageVideo)
+		if !app.accounts.HasCookieBackedAvailableFor(accountUsageVideo) {
+			_ = app.ensureMediaCookieAccount(ctx, accountUsageVideo)
+		}
+		acc, err := app.accounts.AcquireCookieBackedFor(ctx, "", accountUsageVideo)
+		if err != nil {
+			if app.ensureMediaCookieAccount(ctx, accountUsageVideo) {
+				acc, err = app.accounts.AcquireCookieBackedFor(ctx, "", accountUsageVideo)
+			}
+		}
 		if err != nil {
 			app.logWarn(ctx, "视频生成获取账号失败", "attempt", attempt+1, "error", err)
 			return nil, err
@@ -6481,9 +6690,6 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
 				app.logWarn(ctx, "视频生成创建会话失败", "attempt", attempt+1, "error", err)
-				if isUpstreamWAFErrorMessage(err.Error()) {
-					app.tripMediaWAFCircuit(err)
-				}
 				return
 			}
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
@@ -6508,9 +6714,6 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 					lastErr = err
 					app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 					app.logWarn(ctx, "视频生成首帧上传失败", "attempt", attempt+1, "error", err)
-					if isUpstreamWAFErrorMessage(err.Error()) {
-						app.tripMediaWAFCircuit(err)
-					}
 					return
 				}
 				if ref, ok := uploaded["remote_ref"].(map[string]any); ok {
@@ -6525,18 +6728,12 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
 				app.logWarn(ctx, "视频生成上游请求失败", "attempt", attempt+1, "error", err)
-				if isUpstreamWAFErrorMessage(err.Error()) {
-					app.tripMediaWAFCircuit(err)
-				}
 				return
 			}
 			if status != http.StatusOK {
 				lastErr = fmt.Errorf("video completion HTTP %d: %s", status, truncate(body, 500))
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageVideo)
 				app.logWarn(ctx, "视频生成上游状态异常", "attempt", attempt+1, "status", status, "body", truncate(body, 240))
-				if isUpstreamWAFErrorMessage(lastErr.Error()) {
-					app.tripMediaWAFCircuit(lastErr)
-				}
 				return
 			}
 			answerText := body
@@ -6544,9 +6741,6 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 				lastErr = fmt.Errorf("%s", failure)
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageVideo)
 				app.logWarn(ctx, "视频生成上游返回失败", "attempt", attempt+1, "failure", failure)
-				if isUpstreamWAFErrorMessage(failure) {
-					app.tripMediaWAFCircuit(lastErr)
-				}
 				return
 			}
 			urls := extractVideoURLs(answerText)
@@ -6559,9 +6753,6 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 					lastErr = err
 					app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 					app.logWarn(ctx, "视频生成任务轮询失败", "task_id", taskIDs[0], "error", err)
-					if isUpstreamWAFErrorMessage(err.Error()) {
-						app.tripMediaWAFCircuit(err)
-					}
 					return
 				}
 				answerText += "\n" + taskText
@@ -6589,11 +6780,18 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			}
 		}
 		app.logWarn(ctx, "视频生成尝试失败", "attempt", attempt+1, "error", lastErr)
-		if lastErr != nil && isUpstreamWAFErrorMessage(lastErr.Error()) {
-			return nil, app.mediaWAFError(lastErr)
+		if shouldSwitchMediaAccount(lastErr) {
+			if app.accounts.HasCookieBackedAvailableFor(accountUsageVideo) || app.ensureMediaCookieAccount(ctx, accountUsageVideo) {
+				attempts = min(attempts+1, 20)
+				continue
+			}
 		}
-		if !app.accounts.HasAvailableFor(accountUsageVideo) {
-			app.logWarn(ctx, "视频生成账号池已无可用账号", "attempt", attempt+1, "error", lastErr)
+		if !app.accounts.HasCookieBackedAvailableFor(accountUsageVideo) {
+			if app.ensureMediaCookieAccount(ctx, accountUsageVideo) {
+				attempts = min(attempts+1, 20)
+				continue
+			}
+			app.logWarn(ctx, "视频生成账号池已无可用 Cookie 账号", "attempt", attempt+1, "error", lastErr)
 			break
 		}
 	}
@@ -6622,6 +6820,119 @@ func (app *App) mediaRetryAttempts(usage string) int {
 		attempts = app.settings.MaxRetries
 	}
 	return clampInt(attempts, 1, 20)
+}
+
+func shouldSwitchMediaAccount(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return isUpstreamWAFErrorMessage(msg) || isRateLimitErrorMessage(msg) || isTransientUpstreamErrorMessage(msg)
+}
+
+// acquireMediaSlot 串行化或限流媒体上游请求，避免并发请求集中触发 Qwen 风控。
+func (app *App) acquireMediaSlot(ctx context.Context) (func(), error) {
+	if app == nil || cap(app.mediaSlots) == 0 {
+		return func() {}, nil
+	}
+	select {
+	case app.mediaSlots <- struct{}{}:
+		return func() { <-app.mediaSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// ensureMediaCookieAccount 尝试把 token-only 账号刷新为带浏览器验证态的媒体账号。
+func (app *App) ensureMediaCookieAccount(ctx context.Context, usage string) bool {
+	if app == nil || app.accounts == nil || app.settings.MediaCookieRefreshBatch <= 0 {
+		return false
+	}
+	if app.accounts.HasCookieBackedAvailableFor(usage) {
+		return true
+	}
+	app.mediaRefreshMu.Lock()
+	defer app.mediaRefreshMu.Unlock()
+	if app.accounts.HasCookieBackedAvailableFor(usage) {
+		return true
+	}
+	candidates := app.accounts.CookieRefreshCandidates(app.settings.MediaCookieRefreshBatch)
+	for _, acc := range candidates {
+		if ctx.Err() != nil {
+			return false
+		}
+		app.logInfo(ctx, "媒体账号自动刷新浏览器 Cookie 开始", "account", acc.Email, "usage", normalizeAccountUsage(usage))
+		updated, ok, err := app.refreshAccountBrowserCookies(ctx, acc)
+		if err != nil || !ok {
+			app.logWarn(ctx, "媒体账号自动刷新浏览器 Cookie 失败", "account", acc.Email, "error", firstNonEmpty(errorString(err), "not refreshed"))
+			continue
+		}
+		if err := app.accounts.Add(updated); err != nil {
+			app.logWarn(ctx, "媒体账号自动刷新保存失败", "account", acc.Email, "error", err)
+			continue
+		}
+		app.logInfo(ctx, "媒体账号自动刷新浏览器 Cookie 成功", "account", acc.Email, "usage", normalizeAccountUsage(usage))
+		return true
+	}
+	return app.accounts.HasCookieBackedAvailableFor(usage)
+}
+
+// refreshAccountBrowserCookies 用现有 token 采集 Qwen 浏览器验证态 Cookie。
+func (app *App) refreshAccountBrowserCookies(ctx context.Context, acc Account) (Account, bool, error) {
+	if strings.TrimSpace(acc.Token) == "" {
+		return acc, false, errors.New("empty token")
+	}
+	err := app.withBrowser(ctx, func(page pw.Page) error {
+		cookies, err := refreshQwenBrowserSession(ctx, page, acc.Token)
+		if err != nil {
+			return err
+		}
+		acc.Cookies = cookies
+		return nil
+	})
+	if err != nil {
+		return acc, false, err
+	}
+	verify := app.client.VerifyTokenDetailForAccount(ctx, &acc)
+	if !verify.Valid {
+		return acc, false, fmt.Errorf("token verify failed after cookie refresh: %s", firstNonEmpty(verify.Error, verify.StatusCode))
+	}
+	acc.Valid = true
+	acc.ActivationPending = false
+	acc.StatusCode = "valid"
+	acc.LastError = ""
+	return acc, strings.TrimSpace(acc.Cookies) != "", nil
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// waitMediaPace 为媒体上游请求增加全局最小间隔，降低单账号连续请求触发限流的概率。
+func (app *App) waitMediaPace(ctx context.Context) error {
+	if app == nil || app.settings.MediaMinIntervalMS <= 0 {
+		return nil
+	}
+	interval := time.Duration(app.settings.MediaMinIntervalMS) * time.Millisecond
+	app.mediaPaceMu.Lock()
+	defer app.mediaPaceMu.Unlock()
+	if !app.lastMediaStarted.IsZero() {
+		wait := interval - time.Since(app.lastMediaStarted)
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				stopTimer(timer)
+				return ctx.Err()
+			}
+		}
+	}
+	app.lastMediaStarted = time.Now()
+	return nil
 }
 
 func (app *App) mediaWAFCircuitError() error {
@@ -6680,6 +6991,9 @@ func upstreamMediaErrorStatus(err error) int {
 		return http.StatusBadGateway
 	}
 	if isRateLimitErrorMessage(msg) {
+		return http.StatusTooManyRequests
+	}
+	if strings.Contains(strings.ToLower(msg), "qwen browser cookie") {
 		return http.StatusTooManyRequests
 	}
 	if isModelNotFoundErrorMessage(msg) {

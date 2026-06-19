@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
 
 func TestShouldForceToolContinuationAllowsGroundedBashMarker(t *testing.T) {
 	req := StandardRequest{
@@ -109,6 +113,98 @@ func TestAccountPoolPrefersCookieBackedAccounts(t *testing.T) {
 	if acc == nil || acc.Email != "cookie@example.com" {
 		t.Fatalf("expected cookie-backed account first, got %#v", acc)
 	}
+}
+
+func TestAccountPoolCookieBackedAcquireSkipsTokenOnlyAccounts(t *testing.T) {
+	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	pool.accounts = []*Account{
+		{Email: "plain@example.com", Token: "plain", Valid: true, StatusCode: "valid"},
+		{Email: "cookie@example.com", Token: "cookie", Cookies: "cna=abc", Valid: true, StatusCode: "valid"},
+	}
+	pool.resetLocked()
+
+	acc := pool.pickLockedForOptions("", accountUsageVideo, true)
+	if acc == nil || acc.Email != "cookie@example.com" {
+		t.Fatalf("expected media account to require cookies, got %#v", acc)
+	}
+}
+
+func TestCookieRefreshCandidatesReturnValidTokenOnlyAccounts(t *testing.T) {
+	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	pool.accounts = []*Account{
+		{Email: "invalid@example.com", Token: "bad", Valid: false, StatusCode: "invalid"},
+		{Email: "cookie@example.com", Token: "cookie", Cookies: "cna=abc", Valid: true, StatusCode: "valid"},
+		{Email: "plain@example.com", Token: "plain", Valid: true, StatusCode: "valid"},
+	}
+
+	candidates := pool.CookieRefreshCandidates(2)
+	if len(candidates) != 1 || candidates[0].Email != "plain@example.com" {
+		t.Fatalf("expected only valid token-only account candidate, got %#v", candidates)
+	}
+}
+
+func TestMediaSlotSerializesConcurrentMediaWork(t *testing.T) {
+	app := &App{mediaSlots: make(chan struct{}, 1)}
+	release, err := app.acquireMediaSlot(contextBackgroundForTest())
+	if err != nil {
+		t.Fatalf("unexpected slot acquire error: %v", err)
+	}
+	acquired := make(chan bool, 1)
+	go func() {
+		release2, err := app.acquireMediaSlot(contextBackgroundForTest())
+		if err == nil {
+			release2()
+			acquired <- true
+			return
+		}
+		acquired <- false
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second media slot should wait until the first slot is released")
+	default:
+	}
+	release()
+	if !<-acquired {
+		t.Fatal("second media slot should acquire after release")
+	}
+}
+
+func TestVideoTaskResponseIncludesRetryAfterForActiveTasks(t *testing.T) {
+	task := &VideoTask{ID: "video_task_1", Status: "running", Object: videoTaskObjectType, Kind: accountUsageVideo}
+	response := videoTaskResponse(task)
+	if response["retry_after"] != 10 {
+		t.Fatalf("expected retry_after=10 for active task, got %#v", response["retry_after"])
+	}
+}
+
+func TestImageTaskResponseUsesImagePollURL(t *testing.T) {
+	task := &VideoTask{ID: "image_task_1", Status: "queued", Object: imageTaskObjectType, Kind: accountUsageImage}
+	response := videoTaskResponse(task)
+	if response["poll_url"] != "/v1/images/tasks/image_task_1" {
+		t.Fatalf("expected image poll url, got %#v", response["poll_url"])
+	}
+	if response["kind"] != accountUsageImage {
+		t.Fatalf("expected image kind, got %#v", response["kind"])
+	}
+}
+
+func TestWaitMediaPaceAppliesMinimumInterval(t *testing.T) {
+	app := &App{settings: Settings{MediaMinIntervalMS: 20}}
+	if err := app.waitMediaPace(contextBackgroundForTest()); err != nil {
+		t.Fatalf("unexpected first pace error: %v", err)
+	}
+	start := time.Now()
+	if err := app.waitMediaPace(contextBackgroundForTest()); err != nil {
+		t.Fatalf("unexpected second pace error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
+		t.Fatalf("expected media pace wait, elapsed=%s", elapsed)
+	}
+}
+
+func contextBackgroundForTest() context.Context {
+	return context.Background()
 }
 
 func stringsContainsForTest(value, needle string) bool {
