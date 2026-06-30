@@ -203,6 +203,49 @@ func TestWaitMediaPaceAppliesMinimumInterval(t *testing.T) {
 	}
 }
 
+func TestUpstreamMediaFileTypeMapsQwenUploadTypes(t *testing.T) {
+	cases := map[string]string{
+		"image/png":       "image",
+		"audio/mpeg":      "audio",
+		"video/mp4":       "video",
+		"application/pdf": "file",
+		"":                "file",
+	}
+	for contentType, expected := range cases {
+		if got := upstreamMediaFileType(contentType); got != expected {
+			t.Fatalf("expected %q for %q, got %q", expected, contentType, got)
+		}
+	}
+}
+
+func TestBuildUpstreamRemoteRefForParsedDocument(t *testing.T) {
+	ref := buildUpstreamRemoteRef(UploadedLocalFileRecord{Filename: "manual.pdf"}, 128, "application/pdf", "file_1", "user/manual.pdf", "bucket", "oss-cn.example.com", "success", false)
+	if ref["type"] != "file" || ref["showType"] != "file" || ref["file_class"] != "document" {
+		t.Fatalf("unexpected document ref classification: %#v", ref)
+	}
+	file, _ := ref["file"].(map[string]any)
+	meta, _ := file["meta"].(map[string]any)
+	parseMeta, ok := meta["parse_meta"].(map[string]any)
+	if !ok || parseMeta["parse_status"] != "success" {
+		t.Fatalf("expected parse metadata for document ref, got %#v", meta)
+	}
+}
+
+func TestBuildUpstreamRemoteRefForI2VImageSkipsParseMetadata(t *testing.T) {
+	ref := buildUpstreamRemoteRef(UploadedLocalFileRecord{Filename: "frame.png"}, 256, "image/png", "file_2", "user/frame.png", "bucket", "oss-cn.example.com", "", true)
+	if ref["type"] != "image" || ref["showType"] != "image" || ref["file_class"] != "vision" {
+		t.Fatalf("unexpected image ref classification: %#v", ref)
+	}
+	if ref["file_type"] != "image/png" || ref["status"] != "uploaded" {
+		t.Fatalf("unexpected image ref fields: %#v", ref)
+	}
+	file, _ := ref["file"].(map[string]any)
+	meta, _ := file["meta"].(map[string]any)
+	if _, exists := meta["parse_meta"]; exists {
+		t.Fatalf("i2v image ref must not include document parse metadata: %#v", meta)
+	}
+}
+
 func contextBackgroundForTest() context.Context {
 	return context.Background()
 }

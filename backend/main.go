@@ -6709,7 +6709,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 					app.logWarn(ctx, "视频生成首帧不存在", "attempt", attempt+1)
 					return
 				}
-				uploaded, err := app.uploadLocalFileToUpstream(ctx, acc, *record)
+				uploaded, err := app.uploadLocalMediaToUpstream(ctx, acc, *record)
 				if err != nil {
 					lastErr = err
 					app.classifyAccountErrorFor(acc, err, accountUsageVideo)

@@ -932,7 +932,32 @@ func upstreamFileClass(contentType string) string {
 	}
 }
 
+// upstreamMediaFileType 返回 Qwen Web 上传接口识别的媒体类型。
+func upstreamMediaFileType(contentType string) string {
+	lowered := strings.ToLower(strings.TrimSpace(contentType))
+	switch {
+	case strings.HasPrefix(lowered, "image/"):
+		return "image"
+	case strings.HasPrefix(lowered, "audio/"):
+		return "audio"
+	case strings.HasPrefix(lowered, "video/"):
+		return "video"
+	default:
+		return "file"
+	}
+}
+
 func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, local UploadedLocalFileRecord) (map[string]any, error) {
+	return app.uploadLocalToUpstream(ctx, acc, local, true)
+}
+
+// uploadLocalMediaToUpstream 上传图片/音视频素材，跳过仅适用于文档的 parse 流程。
+func (app *App) uploadLocalMediaToUpstream(ctx context.Context, acc *Account, local UploadedLocalFileRecord) (map[string]any, error) {
+	return app.uploadLocalToUpstream(ctx, acc, local, false)
+}
+
+// uploadLocalToUpstream 负责上传本地文件到 Qwen OSS；parse 为 true 时按文档附件流程解析。
+func (app *App) uploadLocalToUpstream(ctx context.Context, acc *Account, local UploadedLocalFileRecord, parse bool) (map[string]any, error) {
 	if app == nil || app.client == nil || acc == nil {
 		return nil, fmt.Errorf("upload prerequisites missing")
 	}
@@ -941,10 +966,14 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		return nil, err
 	}
 	contentType := firstNonEmpty(local.ContentType, mime.TypeByExtension(filepath.Ext(local.Filename)), "application/octet-stream")
+	fileType := "file"
+	if !parse {
+		fileType = upstreamMediaFileType(contentType)
+	}
 	status, text, err := app.client.requestJSONForAccount(ctx, http.MethodPost, "/api/v2/files/getstsToken", acc, map[string]any{
 		"filename": local.Filename,
 		"filesize": len(raw),
-		"filetype": "file",
+		"filetype": fileType,
 	}, 20*time.Second)
 	if err != nil {
 		return nil, err
@@ -989,88 +1018,55 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		return nil, err
 	}
 
-	status, text, err = app.client.requestJSONForAccount(ctx, http.MethodPost, "/api/v2/files/parse", acc, map[string]any{"file_id": fileID}, 20*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("files/parse failed: %d %s", status, truncate(text, 200))
-	}
-
-	deadline := time.Now().Add(time.Duration(maxInt(app.settings.ContextUploadParseTimeoutSeconds, 1)) * time.Second)
-	parseStatus := "pending"
-	for time.Now().Before(deadline) {
-		status, text, err = app.client.requestJSONForAccount(ctx, http.MethodPost, "/api/v2/files/parse/status", acc, map[string]any{"file_id_list": []string{fileID}}, 20*time.Second)
+	parseStatus := ""
+	if parse {
+		// 文档附件必须完成解析后才能被上游上下文引用。
+		status, text, err = app.client.requestJSONForAccount(ctx, http.MethodPost, "/api/v2/files/parse", acc, map[string]any{"file_id": fileID}, 20*time.Second)
 		if err != nil {
 			return nil, err
 		}
 		if status != http.StatusOK {
-			return nil, fmt.Errorf("files/parse/status failed: %d %s", status, truncate(text, 200))
+			return nil, fmt.Errorf("files/parse failed: %d %s", status, truncate(text, 200))
 		}
-		var payload map[string]any
-		if err := json.Unmarshal([]byte(text), &payload); err != nil {
-			return nil, err
+
+		deadline := time.Now().Add(time.Duration(maxInt(app.settings.ContextUploadParseTimeoutSeconds, 1)) * time.Second)
+		parseStatus = "pending"
+		for time.Now().Before(deadline) {
+			status, text, err = app.client.requestJSONForAccount(ctx, http.MethodPost, "/api/v2/files/parse/status", acc, map[string]any{"file_id_list": []string{fileID}}, 20*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			if status != http.StatusOK {
+				return nil, fmt.Errorf("files/parse/status failed: %d %s", status, truncate(text, 200))
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(text), &payload); err != nil {
+				return nil, err
+			}
+			rows := anyList(payload["data"])
+			row := map[string]any{}
+			if len(rows) > 0 {
+				row, _ = rows[0].(map[string]any)
+			}
+			parseStatus = anyString(row["status"], "pending")
+			if parseStatus == "success" {
+				break
+			}
+			if parseStatus == "failed" || parseStatus == "error" {
+				return nil, fmt.Errorf("file parse failed: %s", truncate(mustJSON(row), 200))
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(defaultContextUploadPoll):
+			}
 		}
-		rows := anyList(payload["data"])
-		row := map[string]any{}
-		if len(rows) > 0 {
-			row, _ = rows[0].(map[string]any)
+		if parseStatus != "success" {
+			return nil, fmt.Errorf("file parse timeout: %s", fileID)
 		}
-		parseStatus = anyString(row["status"], "pending")
-		if parseStatus == "success" {
-			break
-		}
-		if parseStatus == "failed" || parseStatus == "error" {
-			return nil, fmt.Errorf("file parse failed: %s", truncate(mustJSON(row), 200))
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(defaultContextUploadPoll):
-		}
-	}
-	if parseStatus != "success" {
-		return nil, fmt.Errorf("file parse timeout: %s", fileID)
 	}
 
-	nowMillis := time.Now().UnixMilli()
-	userID := ""
-	if parts := strings.SplitN(strings.TrimLeft(filePathRemote, "/"), "/", 2); len(parts) >= 2 {
-		userID = parts[0]
-	}
-	putURL := "https://" + bucketName + "." + endpoint + "/" + strings.TrimLeft(filePathRemote, "/")
-	remoteRef := map[string]any{
-		"type": "file",
-		"file": map[string]any{
-			"created_at": nowMillis,
-			"data":       map[string]any{},
-			"filename":   local.Filename,
-			"hash":       nil,
-			"id":         fileID,
-			"user_id":    userID,
-			"meta": map[string]any{
-				"name":         local.Filename,
-				"size":         len(raw),
-				"content_type": contentType,
-				"parse_meta":   map[string]any{"parse_status": parseStatus},
-			},
-			"update_at": nowMillis,
-		},
-		"id":              fileID,
-		"url":             putURL,
-		"name":            local.Filename,
-		"collection_name": "",
-		"progress":        0,
-		"status":          "uploaded",
-		"greenNet":        "success",
-		"size":            len(raw),
-		"error":           "",
-		"itemId":          randomID(),
-		"file_type":       contentType,
-		"showType":        "file",
-		"file_class":      upstreamFileClass(contentType),
-		"uploadTaskId":    randomID(),
-	}
+	remoteRef := buildUpstreamRemoteRef(local, len(raw), contentType, fileID, filePathRemote, bucketName, endpoint, parseStatus, !parse)
 	return map[string]any{
 		"remote_file_id":    fileID,
 		"remote_object_key": filePathRemote,
@@ -1079,6 +1075,64 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		"parse_status":      parseStatus,
 		"remote_ref":        remoteRef,
 	}, nil
+}
+
+// buildUpstreamRemoteRef 构造 Qwen 消息 files 字段中的远端文件引用。
+func buildUpstreamRemoteRef(local UploadedLocalFileRecord, rawSize int, contentType, fileID, filePathRemote, bucketName, endpoint, parseStatus string, media bool) map[string]any {
+	nowMillis := time.Now().UnixMilli()
+	userID := ""
+	if parts := strings.SplitN(strings.TrimLeft(filePathRemote, "/"), "/", 2); len(parts) >= 2 {
+		userID = parts[0]
+	}
+	putURL := "https://" + bucketName + "." + endpoint + "/" + strings.TrimLeft(filePathRemote, "/")
+	refType := "file"
+	showType := "file"
+	fileClass := upstreamFileClass(contentType)
+	if media {
+		// 媒体素材与文档不同，Qwen Web 侧按 image/audio/video 直接引用 OSS 对象。
+		refType = upstreamMediaFileType(contentType)
+		showType = refType
+		fileClass = refType
+		if refType == "image" {
+			fileClass = "vision"
+		}
+	}
+	meta := map[string]any{
+		"name":         local.Filename,
+		"size":         rawSize,
+		"content_type": contentType,
+	}
+	if parseStatus != "" {
+		meta["parse_meta"] = map[string]any{"parse_status": parseStatus}
+	}
+	remoteRef := map[string]any{
+		"type": refType,
+		"file": map[string]any{
+			"created_at": nowMillis,
+			"data":       map[string]any{},
+			"filename":   local.Filename,
+			"hash":       nil,
+			"id":         fileID,
+			"user_id":    userID,
+			"meta":       meta,
+			"update_at":  nowMillis,
+		},
+		"id":              fileID,
+		"url":             putURL,
+		"name":            local.Filename,
+		"collection_name": "",
+		"progress":        0,
+		"status":          "uploaded",
+		"greenNet":        "success",
+		"size":            rawSize,
+		"error":           "",
+		"itemId":          randomID(),
+		"file_type":       contentType,
+		"showType":        showType,
+		"file_class":      fileClass,
+		"uploadTaskId":    randomID(),
+	}
+	return remoteRef
 }
 
 func uniqueRemoteRefs(base []map[string]any, more ...map[string]any) []map[string]any {
