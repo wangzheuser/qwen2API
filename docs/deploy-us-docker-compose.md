@@ -88,6 +88,9 @@ chmod 600 /opt/docker_projects/qwen2api/.env.compose
 
 先不占用生产 `7860`：
 
+`docker-compose.smoke.yml` 使用 Compose `!override` 显式替换 `ports` 和 `volumes`，
+避免临时 smoke 容器继承生产 `7860` 端口映射。
+
 ```bash
 cd /opt/docker_projects/qwen2api
 docker compose \
