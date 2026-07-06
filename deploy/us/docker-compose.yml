@@ -1,0 +1,25 @@
+services:
+  qwen2api:
+    image: qwen2api:${QWEN2API_TAG:-dev-go}
+    container_name: qwen2api
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.compose
+    ports:
+      - "${HOST_PORT:-7860}:${PORT:-7860}"
+    volumes:
+      - /opt/docker_projects/qwen2api/data:/app/data
+      - /opt/docker_projects/qwen2api/logs:/app/logs
+    shm_size: "512m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${PORT:-7860}/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
