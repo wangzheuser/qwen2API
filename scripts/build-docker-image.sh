@@ -7,11 +7,13 @@ IMAGE_TAG="${1:-dev-go-${REVISION}}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 GOPROXY_VALUE="${GOPROXY:-https://goproxy.cn,direct}"
 INSTALL_BROWSERS="${INSTALL_BROWSERS:-true}"
+PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.57.0}"
 
 docker buildx build \
   --platform "${PLATFORM}" \
   --build-arg "GOPROXY=${GOPROXY_VALUE}" \
   --build-arg "INSTALL_BROWSERS=${INSTALL_BROWSERS}" \
+  --build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}" \
   -t "qwen2api:${IMAGE_TAG}" \
   --load \
   "${ROOT_DIR}"

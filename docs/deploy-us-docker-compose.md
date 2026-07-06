@@ -59,6 +59,14 @@ scripts/build-docker-image.sh
 - 镜像：`qwen2api:dev-go-<git短提交>`
 - 导出：`/tmp/qwen2api-dev-go-<git短提交>.tar`
 
+可选环境变量：
+
+- `GOPROXY`：Go 模块代理，默认 `https://goproxy.cn,direct`。
+- `INSTALL_BROWSERS`：是否在镜像构建阶段安装 Chromium，默认 `true`。
+- `PLAYWRIGHT_VERSION`：用于生成 playwright-go driver 目录的 `playwright-core` 版本，默认 `1.57.0`。
+
+说明：`playwright-go v0.5700.1` 需要 `1.57.0` driver。为避免 Playwright driver zip 暂不可用导致构建失败，Dockerfile 会从 npm 的 `playwright-core` 准备 driver 目录，再执行 Chromium 安装。
+
 ## 上传并加载镜像
 
 把 tar 上传到 us 后执行：

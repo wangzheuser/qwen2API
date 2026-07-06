@@ -9,6 +9,18 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
+# Stage 1.5: prepare the Playwright driver from npm.
+#
+# playwright-go v0.5700.1 expects the 1.57.0 driver, but the upstream driver zip
+# may be absent from the Playwright CDN while the npm package is already
+# available. Supplying package/cli.js here lets playwright-go skip driver
+# download and only install browser binaries.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS playwright-driver
+ARG PLAYWRIGHT_VERSION=1.57.0
+WORKDIR /src/playwright-driver
+RUN npm init -y \
+    && npm install --omit=dev --ignore-scripts "playwright-core@${PLAYWRIGHT_VERSION}"
+
 # Stage 2: build the Go backend.
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS backend-builder
 ARG GOPROXY=https://proxy.golang.org,direct
@@ -28,19 +40,23 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Stage 3: runtime image.
 FROM debian:bookworm-slim
 WORKDIR /app
+ARG PLAYWRIGHT_VERSION=1.57.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PORT=7860 \
     LOG_LEVEL=INFO \
     DATA_DIR=/app/data \
     LOGS_DIR=/app/logs \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PLAYWRIGHT_DRIVER_PATH=/ms-playwright-driver/${PLAYWRIGHT_VERSION} \
+    PLAYWRIGHT_NODEJS_PATH=/usr/bin/node
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     wget \
     unzip \
+    nodejs \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -70,6 +86,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=backend-builder /out/qwen2api /usr/local/bin/qwen2api
 COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
+COPY --from=playwright-driver /src/playwright-driver/node_modules/playwright-core /ms-playwright-driver/${PLAYWRIGHT_VERSION}/package
 
 ARG INSTALL_BROWSERS=true
 RUN mkdir -p /app/data /app/logs /ms-playwright \
