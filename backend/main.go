@@ -1328,6 +1328,56 @@ func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, 
 	return acc, true, nil
 }
 
+// refreshAccountToken 用邮箱+密码重新登录换取新 token（不走邮件验证链接）。
+// 仅用于 token 临近过期时的主动刷新场景：账号本身已激活，只需换新 token。
+func (app *App) refreshAccountToken(ctx context.Context, acc Account) (Account, bool) {
+	if acc.Email == "" || acc.Password == "" {
+		return acc, false
+	}
+	// 复用全局浏览器锁，避免与激活流程并发拉起浏览器。
+	browserAutomationMu.Lock()
+	defer browserAutomationMu.Unlock()
+
+	if app.logger != nil {
+		app.logger.Info("token 主动刷新：开始重新登录", "account", acc.Email)
+	}
+	var newToken string
+	err := app.withBrowser(ctx, func(page pw.Page) error {
+		newToken = loginAndGetToken(ctx, page, acc.Email, acc.Password, 30*time.Second)
+		if newToken == "" {
+			// 登录未直接返回 token 时，兜底读一次 localStorage。
+			newToken = localStorageToken(page)
+		}
+		if newToken == "" {
+			return errors.New("login did not yield token")
+		}
+		acc.Cookies = qwenCookieString(page)
+		return nil
+	})
+	if err != nil {
+		if app.logger != nil {
+			app.logger.Warn("token 主动刷新：登录失败", "account", acc.Email, "error", err)
+		}
+		return acc, false
+	}
+	// 官网复验，确认新 token 真正可用再落库。
+	if !app.client.VerifyToken(ctx, newToken) {
+		if app.logger != nil {
+			app.logger.Warn("token 主动刷新：新 token 复验未通过", "account", acc.Email)
+		}
+		return acc, false
+	}
+	acc.Token = newToken
+	acc.Valid = true
+	acc.ActivationPending = false
+	acc.StatusCode = "valid"
+	acc.LastError = "token 已通过主动刷新更新"
+	if app.logger != nil {
+		app.logger.Info("token 主动刷新：成功", "account", acc.Email)
+	}
+	return acc, true
+}
+
 func (app *App) withBrowser(ctx context.Context, fn func(page pw.Page) error) error {
 	if err := installPlaywrightBrowsers(app.logger); err != nil {
 		return fmt.Errorf("playwright install failed: %w", err)
