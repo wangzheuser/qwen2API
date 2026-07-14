@@ -65,6 +65,7 @@ type App struct {
 	sessionStore      *JSONStore
 	fileContentCache  *fileContentCache
 	keepalive         *KeepAliveService
+	tokenRefresh      *TokenRefreshService
 	videoTasks        map[string]*VideoTask
 	videoTasksMu      sync.RWMutex
 	mediaSlots        chan struct{}
@@ -181,6 +182,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 	app.client = NewQwenClient(app.accounts, settings, logger)
 	app.chatPool = NewChatIDPool(app.client, app.accounts, settings, logger)
 	app.keepalive = NewKeepAliveService(logger)
+	app.tokenRefresh = NewTokenRefreshService(app, logger)
 	return app, nil
 }
 
@@ -191,6 +193,9 @@ func (app *App) StartBackground(ctx context.Context) {
 	app.chatPool.Start(ctx)
 	if app.keepalive != nil {
 		app.keepalive.Start(ctx, app.keepaliveConfig())
+	}
+	if app.tokenRefresh != nil {
+		app.tokenRefresh.Start(ctx)
 	}
 	go func() {
 		ticker := time.NewTicker(time.Minute)
@@ -7726,6 +7731,10 @@ func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 	if app.keepalive != nil {
 		keepaliveStatus = app.keepalive.Status()
 	}
+	tokenRefreshStatus := map[string]any{"running": false}
+	if app.tokenRefresh != nil {
+		tokenRefreshStatus = app.tokenRefresh.Status()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":                      Version,
 		"max_inflight_per_account":     app.settings.MaxInflightPerAccount,
@@ -7742,6 +7751,8 @@ func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 		"keepalive_env_locked":         keepaliveCfg.EnvLocked,
 		"keepalive_running":            boolValue(keepaliveStatus["running"]),
 		"keepalive_status":             keepaliveStatus,
+		"token_refresh_running":        boolValue(tokenRefreshStatus["running"]),
+		"token_refresh_status":         tokenRefreshStatus,
 		"model_aliases":                modelMap,
 	})
 }
