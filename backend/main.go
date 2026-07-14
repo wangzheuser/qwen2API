@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2570,6 +2571,162 @@ func (s *KeepAliveService) Status() map[string]any {
 		"last_status_code": s.lastStatusCode,
 		"last_error":       s.lastError,
 		"last_checked":     s.lastChecked,
+	}
+}
+
+// dueAccountsForRefresh 筛出临近过期且可主动刷新的账号。
+// 条件：有密码、非 env 源，且 token 剩余寿命落在 (0, ahead) 区间——已过期或解析失败一律跳过。
+func dueAccountsForRefresh(accounts []Account, now, ahead float64) []Account {
+	due := make([]Account, 0)
+	for _, acc := range accounts {
+		if acc.Password == "" || acc.Source == "env" {
+			continue
+		}
+		remaining := tokenExpiry(acc.Token) - now
+		if remaining > 0 && remaining < ahead {
+			due = append(due, acc)
+		}
+	}
+	return due
+}
+
+// tokenExpiry 解析 JWT 的 exp（秒级时间戳）；无法解析返回 0。仅读 payload，不验签。
+// 内联一份等价实现，避免 main（module root）对 services 子包的额外耦合。
+func tokenExpiry(token string) float64 {
+	if token == "" {
+		return 0
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return 0
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		Exp float64 `json:"exp"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return 0
+	}
+	return claims.Exp
+}
+
+type TokenRefreshService struct {
+	app    *App
+	logger *slog.Logger
+
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	running bool
+
+	lastRun        float64
+	lastRefresh    float64
+	refreshedTotal int
+	failedTotal    int
+	lastError      string
+}
+
+func NewTokenRefreshService(app *App, logger *slog.Logger) *TokenRefreshService {
+	return &TokenRefreshService{app: app, logger: logger}
+}
+
+func (s *TokenRefreshService) Start(parent context.Context) {
+	if s == nil || !s.app.settings.TokenRefreshEnabled {
+		if s != nil && s.logger != nil {
+			s.logger.Info("token 主动刷新未启用，服务不启动")
+		}
+		return
+	}
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.cancel = cancel
+	s.running = true
+	s.mu.Unlock()
+	go s.run(ctx)
+}
+
+func (s *TokenRefreshService) Stop() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.running = false
+	s.mu.Unlock()
+}
+
+func (s *TokenRefreshService) run(ctx context.Context) {
+	interval := time.Duration(s.app.settings.TokenRefreshCheckInterval) * time.Second
+	stagger := time.Duration(s.app.settings.TokenRefreshStaggerMS) * time.Millisecond
+	ahead := float64(s.app.settings.TokenRefreshAheadSeconds)
+	if s.logger != nil {
+		s.logger.Info("token 主动刷新任务启动", "interval_s", s.app.settings.TokenRefreshCheckInterval, "ahead_s", s.app.settings.TokenRefreshAheadSeconds)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		now := float64(time.Now().Unix())
+		s.mu.Lock()
+		s.lastRun = now
+		s.mu.Unlock()
+		due := dueAccountsForRefresh(s.app.accounts.Snapshot(), now, ahead)
+		if len(due) > 0 && s.logger != nil {
+			s.logger.Info("token 主动刷新本轮待刷新账号", "count", len(due))
+		}
+		for _, acc := range due {
+			if ctx.Err() != nil {
+				return
+			}
+			updated, ok := s.app.refreshAccountToken(ctx, acc)
+			s.mu.Lock()
+			if ok {
+				s.refreshedTotal++
+				s.lastRefresh = float64(time.Now().Unix())
+			} else {
+				s.failedTotal++
+			}
+			s.mu.Unlock()
+			if ok {
+				if err := s.app.accounts.Add(updated); err != nil {
+					s.mu.Lock()
+					s.lastError = err.Error()
+					s.mu.Unlock()
+				}
+			}
+			sleepWithContext(ctx, stagger)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *TokenRefreshService) Status() map[string]any {
+	if s == nil {
+		return map[string]any{"running": false}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{
+		"running":         s.running,
+		"enabled":         s.app.settings.TokenRefreshEnabled,
+		"check_interval":  s.app.settings.TokenRefreshCheckInterval,
+		"ahead_seconds":   s.app.settings.TokenRefreshAheadSeconds,
+		"last_run":        s.lastRun,
+		"last_refresh":    s.lastRefresh,
+		"refreshed_total": s.refreshedTotal,
+		"failed_total":    s.failedTotal,
+		"last_error":      s.lastError,
 	}
 }
 
