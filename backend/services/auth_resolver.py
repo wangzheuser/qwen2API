@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html as html_lib
 import json
 import logging
@@ -865,3 +866,34 @@ class AuthResolver:
         except Exception as e:
             log.error(f"[Refresh] {acc.email} 刷新异常: {e}")
             return False
+
+
+def token_expiry(token: str) -> float:
+    """解析 JWT 的 exp（秒级时间戳）；无法解析时返回 0.0。
+
+    仅读取 payload 段，不验签——本服务只需要判断过期时间。
+    """
+    if not token:
+        return 0.0
+    try:
+        # JWT 结构为 header.payload.signature，取中段 base64 解出 payload。
+        payload = token.split(".")[1]
+        # base64url 可能缺少 padding，按 4 字节对齐补齐。
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return float(data.get("exp", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+if __name__ == "__main__":
+    # 纯函数自检：正常 / 空串 / 畸形 / 无 exp 四种情形。
+    def _mk(payload: dict) -> str:
+        enc = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        return f"h.{enc}.s"
+
+    assert token_expiry(_mk({"exp": 1893456000})) == 1893456000.0
+    assert token_expiry("") == 0.0
+    assert token_expiry("garbage") == 0.0
+    assert token_expiry(_mk({"id": "x"})) == 0.0
+    print("token_expiry self-check passed")
