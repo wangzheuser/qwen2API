@@ -1990,6 +1990,10 @@ type Settings struct {
 	LogLevel                               string
 	KeepAliveURL                           string
 	KeepAliveInterval                      int
+	TokenRefreshEnabled                    bool
+	TokenRefreshCheckInterval              int
+	TokenRefreshAheadSeconds               int
+	TokenRefreshStaggerMS                  int
 
 	BaseDir                          string
 	DataDir                          string
@@ -2060,6 +2064,10 @@ func LoadSettings() Settings {
 		LogLevel:                               envString("LOG_LEVEL", "INFO"),
 		KeepAliveURL:                           envString("KEEPALIVE_URL", ""),
 		KeepAliveInterval:                      clampInt(envInt("KEEPALIVE_INTERVAL", keepAliveDefaultInterval), keepAliveMinInterval, keepAliveMaxInterval),
+		TokenRefreshEnabled:                    envBool("TOKEN_REFRESH_ENABLED", true),
+		TokenRefreshCheckInterval:              envInt("TOKEN_REFRESH_CHECK_INTERVAL", 21600),
+		TokenRefreshAheadSeconds:               envInt("TOKEN_REFRESH_AHEAD_SECONDS", 259200),
+		TokenRefreshStaggerMS:                  envInt("TOKEN_REFRESH_STAGGER_MS", 2000),
 		BaseDir:                                base,
 		DataDir:                                data,
 		LogsDir:                                logs,
