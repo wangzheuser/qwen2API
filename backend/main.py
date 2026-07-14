@@ -28,6 +28,7 @@ from backend.api import admin, v1_chat, probes, anthropic, gemini, embeddings, i
 from backend.services.garbage_collector import garbage_collect_chats
 from backend.services.context_cleanup import context_cleanup_loop
 from backend.services.keepalive import KeepAliveService
+from backend.services.token_refresh import TokenRefreshService
 
 configure_logging(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 log = logging.getLogger("qwen2api")
@@ -112,6 +113,12 @@ async def lifespan(app: FastAPI):
         app.state.keepalive_service = KeepAliveService(app.state.config_db)
         await app.state.keepalive_service.start()
 
+        app.state.token_refresh_service = TokenRefreshService(
+            app.state.account_pool,
+            app.state.qwen_executor.auth_resolver,
+        )
+        await app.state.token_refresh_service.start()
+
     yield
 
     with request_context(surface="shutdown"):
@@ -123,6 +130,9 @@ async def lifespan(app: FastAPI):
         keepalive_service = getattr(app.state, "keepalive_service", None)
         if keepalive_service:
             await keepalive_service.stop()
+        token_refresh_service = getattr(app.state, "token_refresh_service", None)
+        if token_refresh_service:
+            await token_refresh_service.stop()
         video_task_runner = getattr(app.state, "video_task_runner", None)
         if video_task_runner:
             await video_task_runner.stop()

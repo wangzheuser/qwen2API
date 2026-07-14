@@ -406,6 +406,10 @@ async def get_settings(request: Request):
         "keepalive_env_locked": keepalive_config["env_locked"],
         "keepalive_running": keepalive_service.is_running if keepalive_service else False,
         "keepalive_status": keepalive_service.status() if keepalive_service else {},
+        "token_refresh_running": getattr(request.app.state, "token_refresh_service", None).is_running
+            if getattr(request.app.state, "token_refresh_service", None) else False,
+        "token_refresh_status": getattr(request.app.state, "token_refresh_service", None).status()
+            if getattr(request.app.state, "token_refresh_service", None) else {},
         "model_aliases": safe_map,
     }
 
