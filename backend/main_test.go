@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -243,6 +245,78 @@ func TestBuildUpstreamRemoteRefForI2VImageSkipsParseMetadata(t *testing.T) {
 	meta, _ := file["meta"].(map[string]any)
 	if _, exists := meta["parse_meta"]; exists {
 		t.Fatalf("i2v image ref must not include document parse metadata: %#v", meta)
+	}
+}
+
+func TestExtractInlineImagePayloadSupportsLLMProtocols(t *testing.T) {
+	raw := []byte("image-bytes")
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	cases := []map[string]any{
+		{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + encoded}},
+		{"type": "input_image", "image_url": "data:image/png;base64," + encoded},
+		{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": encoded}},
+	}
+	for _, block := range cases {
+		_, contentType, got, fileID, ok, err := extractInlineImagePayload(block)
+		if err != nil || !ok || fileID != "" || contentType != "image/png" || string(got) != string(raw) {
+			t.Fatalf("unexpected normalized image: type=%q file=%q ok=%v err=%v raw=%q", contentType, fileID, ok, err, got)
+		}
+	}
+
+	_, _, _, fileID, ok, err := extractInlineImagePayload(map[string]any{"type": "image", "source": map[string]any{"type": "file", "file_id": "file-1"}})
+	if err != nil || !ok || fileID != "file-1" {
+		t.Fatalf("unexpected Anthropic file image: file=%q ok=%v err=%v", fileID, ok, err)
+	}
+}
+
+func TestGeminiToChatBodyPreservesInlineImage(t *testing.T) {
+	body := geminiToChatBody("qwen3.8-max-preview", map[string]any{"contents": []any{map[string]any{
+		"role": "user",
+		"parts": []any{
+			map[string]any{"inlineData": map[string]any{"mimeType": "image/png", "data": "YWJj"}},
+			map[string]any{"text": "describe it"},
+		},
+	}}}, false)
+	messages := anyList(body["messages"])
+	message, _ := messages[0].(map[string]any)
+	parts := anyList(message["content"])
+	image, _ := parts[0].(map[string]any)
+	imageURL, _ := image["image_url"].(map[string]any)
+	if image["type"] != "image_url" || imageURL["url"] != "data:image/png;base64,YWJj" {
+		t.Fatalf("Gemini inline image was not preserved: %#v", parts)
+	}
+}
+
+func TestPreprocessAttachmentsNormalizesAnthropicImage(t *testing.T) {
+	dir := t.TempDir()
+	app := &App{
+		settings:          Settings{ContextGeneratedDir: filepath.Join(dir, "context")},
+		uploadedFileStore: NewJSONStore(filepath.Join(dir, "uploaded_files.json"), []any{}),
+	}
+	imageBase64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	payload := map[string]any{
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": imageBase64}},
+				map[string]any{"type": "text", "text": "describe"},
+			},
+		}},
+	}
+
+	result, err := app.preprocessAttachments(payload, "owner-token")
+	if err != nil {
+		t.Fatalf("unexpected preprocess error: %v", err)
+	}
+	if len(result.Attachments) != 1 || result.Attachments[0].ContentType != "image/png" {
+		t.Fatalf("unexpected normalized attachments: %#v", result.Attachments)
+	}
+	messages := anyList(result.Payload["messages"])
+	message, _ := messages[0].(map[string]any)
+	parts := anyList(message["content"])
+	image, _ := parts[0].(map[string]any)
+	if image["type"] != "input_image" || image["file_id"] == "" {
+		t.Fatalf("Anthropic image was not rewritten: %#v", image)
 	}
 }
 

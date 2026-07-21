@@ -635,6 +635,63 @@ func extractInlineFilePayload(block map[string]any) (string, string, []byte, boo
 	return "", "", nil, false, nil
 }
 
+// extractInlineImagePayload normalizes OpenAI and Anthropic inline image blocks.
+func extractInlineImagePayload(block map[string]any) (string, string, []byte, string, bool, error) {
+	partType := stringValue(block, "type", "")
+	if partType == "image" {
+		source, _ := block["source"].(map[string]any)
+		switch stringValue(source, "type", "") {
+		case "base64":
+			raw, err := base64.StdEncoding.DecodeString(stringValue(source, "data", ""))
+			return "inline-image", stringValue(source, "media_type", ""), raw, "", true, err
+		case "file":
+			return "", "", nil, stringValue(source, "file_id", ""), true, nil
+		default:
+			return "", "", nil, "", true, fmt.Errorf("unsupported Anthropic image source type")
+		}
+	}
+	if partType != "image_url" && partType != "input_image" {
+		return "", "", nil, "", false, nil
+	}
+	if fileID := strings.TrimSpace(stringValue(block, "file_id", "")); fileID != "" {
+		return "", "", nil, fileID, true, nil
+	}
+	urlText := ""
+	switch value := block["image_url"].(type) {
+	case string:
+		urlText = value
+	case map[string]any:
+		urlText = stringValue(value, "url", "")
+	}
+	urlText = strings.TrimSpace(firstNonEmpty(urlText, stringValue(block, "url", "")))
+	if urlText == "" {
+		return "", "", nil, "", true, fmt.Errorf("image input is missing image_url or file_id")
+	}
+	if !strings.HasPrefix(urlText, "data:") {
+		return "", "", nil, "", true, fmt.Errorf("remote image URLs are not supported; use a data URI or file_id")
+	}
+	contentType, raw, err := decodeDataURI(urlText)
+	return "inline-image", contentType, raw, "", true, err
+}
+
+// validateImageBytes rejects oversized or mislabeled image payloads at the request boundary.
+func validateImageBytes(contentType string, raw []byte) (string, error) {
+	if len(raw) == 0 {
+		return "", fmt.Errorf("image is empty")
+	}
+	if len(raw) > videoFirstFrameMaxBytes {
+		return "", fmt.Errorf("image exceeds %d bytes", videoFirstFrameMaxBytes)
+	}
+	detected := http.DetectContentType(raw)
+	if !strings.HasPrefix(strings.ToLower(detected), "image/") {
+		return "", fmt.Errorf("image data has non-image MIME type %s", detected)
+	}
+	if declared := strings.TrimSpace(contentType); declared != "" && !strings.HasPrefix(strings.ToLower(declared), "image/") {
+		return "", fmt.Errorf("image has non-image MIME type %s", declared)
+	}
+	return detected, nil
+}
+
 func (app *App) preprocessAttachments(payload map[string]any, ownerToken string) (PreprocessedAttachments, error) {
 	rewritten := deepCopyMap(payload)
 	out := PreprocessedAttachments{Payload: rewritten}
@@ -652,19 +709,40 @@ func (app *App) preprocessAttachments(payload map[string]any, ownerToken string)
 			if !ok {
 				continue
 			}
-			partType := stringValue(part, "type", "")
-			switch partType {
-			case "image_url":
-				imageURL, _ := part["image_url"].(map[string]any)
-				urlText := strings.TrimSpace(anyString(firstNonNil(imageURL["url"], part["url"]), ""))
-				if !strings.HasPrefix(urlText, "data:") {
+			filename, contentType, bytesValue, fileID, image, err := extractInlineImagePayload(part)
+			if err != nil {
+				return PreprocessedAttachments{}, err
+			}
+			if image {
+				if fileID != "" {
+					record, err := app.getUploadedLocalFile(fileID, ownerToken)
+					if err != nil {
+						return PreprocessedAttachments{}, err
+					}
+					if record == nil {
+						return PreprocessedAttachments{}, fmt.Errorf("image file_id not found")
+					}
+					raw, err := os.ReadFile(record.Path)
+					if err != nil {
+						return PreprocessedAttachments{}, err
+					}
+					if _, err := validateImageBytes(record.ContentType, raw); err != nil {
+						return PreprocessedAttachments{}, err
+					}
+					out.Attachments = append(out.Attachments, NormalizedAttachment{FileID: record.ID, Filename: record.Filename, ContentType: record.ContentType, Source: firstNonEmpty(record.Source, "upload-ref"), LocalPath: record.Path, SHA256: record.SHA256, Purpose: firstNonEmpty(record.Purpose, "user-upload")})
+					contentList[partIndex] = map[string]any{"type": "input_image", "file_id": record.ID, "mime_type": record.ContentType, "filename": record.Filename}
 					continue
 				}
-				contentType, bytesValue, err := decodeDataURI(urlText)
+				contentType, err = validateImageBytes(contentType, bytesValue)
 				if err != nil {
 					return PreprocessedAttachments{}, err
 				}
-				record, err := app.saveLocalBytes("inline-image", contentType, bytesValue, "inline-image", "user-upload", ownerToken, true)
+				if filepath.Ext(filename) == "" {
+					if extensions, _ := mime.ExtensionsByType(contentType); len(extensions) > 0 {
+						filename += extensions[0]
+					}
+				}
+				record, err := app.saveLocalBytes(filename, contentType, bytesValue, "inline-image", "user-upload", ownerToken, true)
 				if err != nil {
 					return PreprocessedAttachments{}, err
 				}
@@ -679,6 +757,10 @@ func (app *App) preprocessAttachments(payload map[string]any, ownerToken string)
 					Purpose:     "user-upload",
 				})
 				contentList[partIndex] = map[string]any{"type": "input_image", "file_id": record.ID, "mime_type": contentType, "filename": record.Filename}
+				continue
+			}
+			partType := stringValue(part, "type", "")
+			switch partType {
 			case "input_file", "file":
 				if existingFileID := strings.TrimSpace(anyString(part["file_id"], "")); existingFileID != "" {
 					record, err := app.getUploadedLocalFile(existingFileID, ownerToken)
@@ -1233,7 +1315,13 @@ func (app *App) prepareContextAttachments(ctx context.Context, payload map[strin
 			appendRemote(cached.RemoteFileMeta)
 			return nil
 		}
-		remote, err := app.uploadLocalFileToUpstream(ctx, acc, local)
+		var remote map[string]any
+		var err error
+		if strings.HasPrefix(strings.ToLower(local.ContentType), "image/") {
+			remote, err = app.uploadLocalMediaToUpstream(ctx, acc, local)
+		} else {
+			remote, err = app.uploadLocalFileToUpstream(ctx, acc, local)
+		}
 		if err != nil {
 			return err
 		}

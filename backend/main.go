@@ -5099,6 +5099,12 @@ func transientUpstreamCooldownSeconds(settings Settings) int {
 
 func (app *App) recordStandardRequest(ctx context.Context, req StandardRequest) {
 	markers := findLogTestMarkers(req.Prompt)
+	imageCount := 0
+	for _, file := range req.UpstreamFiles {
+		if stringValue(file, "type", "") == "image" {
+			imageCount++
+		}
+	}
 	testMarker := "-"
 	if len(markers) > 0 {
 		testMarker = strings.Join(markers, ",")
@@ -5118,6 +5124,8 @@ func (app *App) recordStandardRequest(ctx context.Context, req StandardRequest) 
 		"tools", strings.Join(req.ToolNames, ","),
 		"thinking_forced", req.ForceThinking,
 		"search", req.EnableSearch,
+		"upstream_file_count", len(req.UpstreamFiles),
+		"image_count", imageCount,
 		"prompt_tail", promptTail(req.Prompt, 600),
 		"prompt_sha256", promptSHA256(req.Prompt),
 	)
@@ -6078,7 +6086,8 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 }
 
 func (app *App) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -6087,7 +6096,11 @@ func (app *App) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := geminiModelFromPath(r.URL.Path)
-	req := buildChatStandardRequest(geminiToChatBody(model, body, false), model, "gemini")
+	req, err := app.prepareStandardRequest(r.Context(), r, geminiToChatBody(model, body, false), model, "gemini", auth.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	app.recordStandardRequest(r.Context(), req)
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
@@ -6098,7 +6111,8 @@ func (app *App) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) handleGeminiStream(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -6107,7 +6121,11 @@ func (app *App) handleGeminiStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := geminiModelFromPath(r.URL.Path)
-	req := buildChatStandardRequest(geminiToChatBody(model, body, true), model, "gemini")
+	req, err := app.prepareStandardRequest(r.Context(), r, geminiToChatBody(model, body, true), model, "gemini", auth.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	app.recordStandardRequest(r.Context(), req)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	result, err := app.runCompletion(r.Context(), req, "")
@@ -6152,8 +6170,18 @@ func geminiToChatBody(model string, body map[string]any, stream bool) map[string
 		var parts []any
 		for _, part := range anyList(m["parts"]) {
 			pm, ok := part.(map[string]any)
-			if ok && pm["text"] != nil {
+			if !ok {
+				continue
+			}
+			if pm["text"] != nil {
 				parts = append(parts, map[string]any{"type": "text", "text": stringValue(pm, "text", "")})
+				continue
+			}
+			inlineData, _ := firstNonNil(pm["inlineData"], pm["inline_data"]).(map[string]any)
+			if inlineData != nil {
+				mimeType := firstNonEmpty(stringValue(inlineData, "mimeType", ""), stringValue(inlineData, "mime_type", ""))
+				data := stringValue(inlineData, "data", "")
+				parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + mimeType + ";base64," + data}})
 			}
 		}
 		messages = append(messages, map[string]any{"role": role, "content": parts})
