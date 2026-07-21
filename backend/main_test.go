@@ -320,6 +320,21 @@ func TestPreprocessAttachmentsNormalizesAnthropicImage(t *testing.T) {
 	}
 }
 
+func TestUpstreamFilesForAccountDropsForeignSessionFiles(t *testing.T) {
+	requestFile := map[string]any{"id": "request-file"}
+	sessionFile := map[string]any{"id": "session-file"}
+	record := &SessionAffinityRecord{AccountEmail: "old@example.com", UploadedFiles: []map[string]any{sessionFile}}
+
+	files := upstreamFilesForAccount([]map[string]any{requestFile}, record, "new@example.com")
+	if len(files) != 1 || files[0]["id"] != "request-file" {
+		t.Fatalf("foreign session files must be dropped after account rebinding: %#v", files)
+	}
+	files = upstreamFilesForAccount([]map[string]any{requestFile}, record, "old@example.com")
+	if len(files) != 2 {
+		t.Fatalf("same-account session files should be retained: %#v", files)
+	}
+}
+
 func contextBackgroundForTest() context.Context {
 	return context.Background()
 }

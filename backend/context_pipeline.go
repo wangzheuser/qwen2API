@@ -981,6 +981,15 @@ func dedupeUpstreamFiles(files []map[string]any) []map[string]any {
 	return out
 }
 
+// upstreamFilesForAccount keeps cached file references bound to their owning upstream account.
+func upstreamFilesForAccount(requestFiles []map[string]any, record *SessionAffinityRecord, accountEmail string) []map[string]any {
+	files := append([]map[string]any(nil), requestFiles...)
+	if record != nil && strings.EqualFold(strings.TrimSpace(record.AccountEmail), strings.TrimSpace(accountEmail)) {
+		files = append(files, record.UploadedFiles...)
+	}
+	return dedupeUpstreamFiles(files)
+}
+
 func findUpstreamCacheEntry(entries []UpstreamFileCacheEntry, sessionKey, accountEmail, sha, ext string) *UpstreamFileCacheEntry {
 	now := time.Now().Unix()
 	for _, entry := range entries {
@@ -1236,20 +1245,17 @@ func (app *App) prepareContextAttachments(ctx context.Context, payload map[strin
 	}
 	plan := planContextOffload(app.settings, anyList(payload["messages"]), tools, clientProfile)
 	useGeneratedContextFiles := len(plan.GeneratedFiles) > 0 && len(tools) == 0
-	upstreamFiles := []map[string]any{}
+	requestUpstreamFiles := []map[string]any{}
 	for _, raw := range anyList(payload["upstream_files"]) {
 		if item, ok := raw.(map[string]any); ok {
-			upstreamFiles = append(upstreamFiles, item)
+			requestUpstreamFiles = append(requestUpstreamFiles, item)
 		}
 	}
-	if record != nil {
-		upstreamFiles = append(upstreamFiles, record.UploadedFiles...)
-	}
-	upstreamFiles = dedupeUpstreamFiles(upstreamFiles)
 	preferredEmail := ""
 	if record != nil {
 		preferredEmail = record.AccountEmail
 	}
+	upstreamFiles := upstreamFilesForAccount(requestUpstreamFiles, record, preferredEmail)
 	if len(attachments) == 0 && !useGeneratedContextFiles {
 		return PreparedRequestContext{
 			Payload:           payload,
@@ -1261,10 +1267,23 @@ func (app *App) prepareContextAttachments(ctx context.Context, payload map[strin
 		}, nil
 	}
 
-	acc, err := app.accounts.Acquire(ctx, preferredEmail)
+	requireCookies := false
+	for _, attachment := range attachments {
+		if strings.HasPrefix(strings.ToLower(attachment.ContentType), "image/") {
+			requireCookies = true
+			break
+		}
+	}
+	var acc *Account
+	if requireCookies {
+		acc, err = app.accounts.AcquireCookieBackedFor(ctx, preferredEmail, accountUsageChat)
+	} else {
+		acc, err = app.accounts.Acquire(ctx, preferredEmail)
+	}
 	if err != nil {
 		return PreparedRequestContext{}, err
 	}
+	upstreamFiles = upstreamFilesForAccount(requestUpstreamFiles, record, acc.Email)
 	boundRecord := SessionAffinityRecord{
 		SessionKey:    sessionKey,
 		Surface:       surface,
