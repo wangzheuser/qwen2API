@@ -3057,7 +3057,7 @@ func (app *App) runCompletionWithHooks(ctx context.Context, req StandardRequest,
 	setRequestLogFields(ctx, "chat_id", chatID)
 	app.logInfo(ctx, "创建上游会话", "chat_type", req.ChatType, "prewarmed", reused)
 
-	payload := buildChatPayload(chatID, req.ResolvedModel, req.Prompt, req.ToolEnabled, req.UpstreamFiles, req.ChatType, nil, req.ThinkingEnabled, req.EnableSearch)
+	payload := buildChatPayload(chatID, req.ResolvedModel, req.Prompt, req.ToolEnabled, req.UpstreamFiles, req.ChatType, nil, upstreamThinkingEnabled(req), req.EnableSearch)
 	result := CompletionResult{FinishReason: "stop"}
 	start := time.Now()
 	var sieve *toolcall.ToolSieve
@@ -3261,6 +3261,17 @@ func (app *App) runCompletionWithHooks(ctx context.Context, req StandardRequest,
 		app.logInfo(ctx, "[Collect] finalize", "reason", collectFinalizeReason(result, result.ToolCalls), "chat_id", chatID, "tool_calls", len(result.ToolCalls), "answer_chars", len(result.AnswerText), "reasoning_chars", len(result.ReasoningText), "finish_reason", firstNonEmpty(result.FinishReason, "stop"))
 	}
 	return result, nil
+}
+
+// upstreamThinkingEnabled keeps Qwen vision requests in a supported thinking mode.
+func upstreamThinkingEnabled(req StandardRequest) *bool {
+	for _, file := range req.UpstreamFiles {
+		if stringValue(file, "type", "") == "image" {
+			enabled := true
+			return &enabled
+		}
+	}
+	return req.ThinkingEnabled
 }
 
 func (app *App) captureDetectedToolCalls(ctx context.Context, req StandardRequest, result *CompletionResult, calls []ParsedToolCall, stage string) bool {

@@ -335,6 +335,18 @@ func TestUpstreamFilesForAccountDropsForeignSessionFiles(t *testing.T) {
 	}
 }
 
+func TestUpstreamThinkingEnabledForVision(t *testing.T) {
+	disabled := false
+	got := upstreamThinkingEnabled(StandardRequest{ThinkingEnabled: &disabled, UpstreamFiles: []map[string]any{{"type": "image"}}})
+	if got == nil || !*got {
+		t.Fatal("vision requests must force upstream thinking mode")
+	}
+	got = upstreamThinkingEnabled(StandardRequest{ThinkingEnabled: &disabled})
+	if got == nil || *got {
+		t.Fatal("text requests should preserve the requested thinking mode")
+	}
+}
+
 func contextBackgroundForTest() context.Context {
 	return context.Background()
 }
