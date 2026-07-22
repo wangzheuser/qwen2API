@@ -1,0 +1,21 @@
+services:
+  qwen2api-router:
+    image: nginx:alpine
+    container_name: qwen2api-router
+    restart: unless-stopped
+    ports:
+      - "${BLUE_GREEN_BIND_ADDRESS:-172.17.0.1}:7860:7860"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./qwen2api-router.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7860/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

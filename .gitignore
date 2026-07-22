@@ -33,6 +33,7 @@ fix_*.py
 deploy/**/.env
 deploy/**/.env.*
 !deploy/**/*.example
+deploy/us/qwen2api-router.conf
 
 # Docker/image artifacts
 *.tar

@@ -52,6 +52,8 @@ ssh "${SSH_ARGS[@]}" "${SSH_TARGET}" 'command -v docker >/dev/null && command -v
 scp "${SCP_ARGS[@]}" \
   "${ROOT_DIR}/deploy/us/docker-compose.yml" \
   "${ROOT_DIR}/deploy/us/docker-compose.blue-green.yml" \
+  "${ROOT_DIR}/deploy/us/docker-compose.router.yml" \
+  "${ROOT_DIR}/deploy/us/qwen2api-router.conf.template" \
   "${SSH_TARGET}:${REMOTE_DIR}/"
 ssh "${SSH_ARGS[@]}" "${SSH_TARGET}" python3 - "${remote_archive}" "${remote_parts_dir}" <<'PY'
 from pathlib import Path
@@ -95,6 +97,10 @@ blue_port="$7"
 green_port="$8"
 state_file="${deploy_dir}/.active-slot"
 proxy_backup="${proxy_config}.qwen2api-deploy-backup"
+router_config="${deploy_dir}/qwen2api-router.conf"
+router_template="${deploy_dir}/qwen2api-router.conf.template"
+router_backup="${router_config}.deploy-backup"
+router_compose="${deploy_dir}/docker-compose.router.yml"
 
 cleanup_archive() { rm -f "${archive}"; }
 trap cleanup_archive EXIT
@@ -106,8 +112,8 @@ test -f .env.compose
 active_slot="legacy"
 [[ -f "${state_file}" ]] && active_slot="$(cat "${state_file}")"
 case "${active_slot}" in
-  blue) candidate_slot="green"; candidate_port="${green_port}" ;;
-  green) candidate_slot="blue"; candidate_port="${blue_port}" ;;
+  blue) active_port="${blue_port}"; candidate_slot="green"; candidate_port="${green_port}" ;;
+  green) active_port="${green_port}"; candidate_slot="blue"; candidate_port="${blue_port}" ;;
   legacy) candidate_slot="green"; candidate_port="${green_port}" ;;
   *) printf 'Invalid active slot: %s\n' "${active_slot}" >&2; exit 1 ;;
 esac
@@ -130,15 +136,64 @@ if [[ "${candidate_ready}" != "true" ]]; then
   exit 1
 fi
 
+# Render the stable internal router without storing runtime values in Git.
+render_router_config() {
+  python3 - "${router_template}" "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+template = Path(sys.argv[1]).read_text()
+output = Path(sys.argv[2])
+port = sys.argv[3]
+if not port.isdigit():
+    raise SystemExit("invalid router target port")
+output.write_text(template.replace("__QWEN2API_TARGET_PORT__", port))
+PY
+}
+
+# Reuse the service-owned nginx router so internal clients keep port 7860.
+switch_router() {
+  render_router_config "${router_config}" "$1"
+  docker compose -p qwen2api_router -f "${router_compose}" up -d
+  docker exec qwen2api-router nginx -t >/dev/null
+  docker exec qwen2api-router nginx -s reload
+  for _ in $(seq 1 30); do
+    curl -fsS http://172.17.0.1:7860/healthz >/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
 cp "${proxy_config}" "${proxy_backup}"
-rollback_proxy() {
+router_switched=false
+legacy_stopped=false
+rollback_routes() {
+  if [[ "${legacy_stopped}" == "true" ]]; then
+    docker stop qwen2api-router >/dev/null 2>&1 || true
+    docker start qwen2api >/dev/null 2>&1 || true
+  elif [[ "${router_switched}" == "true" && -f "${router_backup}" ]]; then
+    cp "${router_backup}" "${router_config}"
+    docker compose -p qwen2api_router -f "${router_compose}" up -d >/dev/null
+    docker exec qwen2api-router nginx -t >/dev/null
+    docker exec qwen2api-router nginx -s reload
+  fi
   cp "${proxy_backup}" "${proxy_config}"
   docker exec "${proxy_container}" nginx -t >/dev/null
   docker exec "${proxy_container}" nginx -s reload
   docker stop "qwen2api-${candidate_slot}" >/dev/null 2>&1 || true
-  rm -f "${proxy_backup}"
+  rm -f "${proxy_backup}" "${router_backup}"
 }
-trap 'rollback_proxy; cleanup_archive' ERR
+trap 'rollback_routes; cleanup_archive' ERR
+
+if [[ "${active_slot}" != "legacy" ]]; then
+  if [[ -f "${router_config}" ]]; then
+    cp "${router_config}" "${router_backup}"
+  else
+    render_router_config "${router_backup}" "${active_port}"
+  fi
+  router_switched=true
+  switch_router "${candidate_port}"
+fi
 
 QWEN2API_PROXY_CONFIG="${proxy_config}" QWEN2API_TARGET_PORT="${candidate_port}" python3 - <<'PY'
 import os
@@ -184,15 +239,23 @@ for _ in $(seq 1 30); do
 done
 curl -fsS "${public_health_url}" >/dev/null
 
+if [[ "${active_slot}" == "legacy" ]]; then
+  docker stop qwen2api >/dev/null
+  legacy_stopped=true
+  router_switched=true
+  switch_router "${candidate_port}"
+fi
+
 printf '%s\n' "${candidate_slot}" > "${state_file}"
 printf '%s\n' "${new_tag}" > "${deploy_dir}/.slot-${candidate_slot}-tag"
 case "${active_slot}" in
-  blue|green) docker stop "qwen2api-${active_slot}" >/dev/null 2>&1 || true ;;
-  legacy) docker stop qwen2api >/dev/null 2>&1 || true ;;
+  blue|green) docker stop "qwen2api-${active_slot}" >/dev/null ;;
 esac
-rm -f "${proxy_backup}"
+rm -f "${proxy_backup}" "${router_backup}"
 trap cleanup_archive EXIT
 
 docker ps --filter "name=qwen2api-${candidate_slot}" --format '{{.Names}} {{.Image}} {{.Status}}'
+docker ps --filter "name=qwen2api-router" --format '{{.Names}} {{.Image}} {{.Status}}'
+curl -fsS http://172.17.0.1:7860/healthz
 curl -fsS "${public_health_url}"
 REMOTE

@@ -6,10 +6,13 @@ us 生产服务器只负责加载镜像和启动容器，禁止执行源码构�
 
 - blue：`172.17.0.1:17861`
 - green：`172.17.0.1:17862`
+- `qwen2api-router`：固定监听 `172.17.0.1:7860`，转发到当前活动槽，供 New API 等内部服务使用
 - `nginx-proxy`：把 `qwen2api.codeai.de5.net` 切换到当前活动端口
 - 数据和日志：继续挂载 `/opt/docker_projects/qwen2api/data`、`/opt/docker_projects/qwen2api/logs`
 
 候选容器健康后才修改 nginx；公网验证通过后停止旧容器。失败时恢复 nginx 配置并停止候选容器。候选容器延迟 180 秒启动 token 刷新任务，避免蓝绿短暂并行期间同时写账号文件。
+
+内部调用方只能使用稳定地址 `http://172.17.0.1:7860`，不得直接引用 `17861` 或 `17862`。部署脚本会同步切换服务自有的 `qwen2api-router`，因此内部配置不随槽位变化。
 
 ## Git 安全
 
@@ -17,6 +20,8 @@ us 生产服务器只负责加载镜像和启动容器，禁止执行源码构�
 
 - `deploy/us/docker-compose.yml`
 - `deploy/us/docker-compose.blue-green.yml`
+- `deploy/us/docker-compose.router.yml`
+- `deploy/us/qwen2api-router.conf.template`
 - `deploy/us/docker-compose.smoke.yml`
 - `deploy/us/.env.compose.example`
 - `scripts/build-docker-image.sh`
@@ -64,10 +69,11 @@ scripts/deploy-us-image.sh
 3. 把压缩镜像拆成小分片逐个 SCP 上传，并在 us 合并；单次连接中断不会产生不可识别的半包镜像。
 4. us 执行 `docker load`，立即删除上传归档。
 5. 在非活动槽启动候选容器并检查 `/healthz`。
-6. 备份 nginx 配置、修改 qwen2api server block、执行 `nginx -t` 和 reload。
-7. 验证公网 `/healthz`；失败自动恢复 nginx 并停止候选容器。
-8. 验证成功后记录活动槽、停止旧容器并删除临时 nginx 备份。
-9. 本地退出时删除构建归档。
+6. 把服务自有的 `qwen2api-router` 切到候选槽，验证稳定内部入口 `172.17.0.1:7860`。
+7. 备份公网 nginx 配置、修改 qwen2api server block、执行 `nginx -t` 和 reload。
+8. 验证公网 `/healthz`；失败自动恢复内部路由和公网 nginx，并停止候选容器。
+9. 验证成功后记录活动槽、停止旧容器并删除临时备份。
+10. 本地退出时删除构建归档。
 
 认证由 SSH config、ssh-agent 或调用者环境提供，不得写入脚本或 Git。
 
@@ -96,6 +102,7 @@ scripts/deploy-us-image.sh dev-go-<git短提交>
 ```bash
 cat /opt/docker_projects/qwen2api/.active-slot
 docker ps --filter name=qwen2api-
+curl -fsS http://172.17.0.1:7860/healthz
 docker exec nginx-proxy nginx -t
 curl -fsS https://qwen2api.codeai.de5.net/healthz
 ```
