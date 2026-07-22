@@ -64,12 +64,12 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 		thinking := true
 		autoThinking := true
 		thinkingMode := "Auto"
-		if hasCustomTools {
+		if hasCustomTools && !requiresThinking(model) {
 			thinking = false
 			autoThinking = false
 			thinkingMode = "Disabled"
 		}
-		if thinkingEnabled != nil {
+		if thinkingEnabled != nil && !requiresThinking(model) {
 			thinking = *thinkingEnabled
 			autoThinking = *thinkingEnabled
 			if thinking {
@@ -106,6 +106,11 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 		payload["size"] = imageRatio(imageOptions)
 	}
 	return payload
+}
+
+// requiresThinking 标识不接受关闭思考模式的上游模型。
+func requiresThinking(model string) bool {
+	return model == "qwen3.8-max-preview"
 }
 
 func imageRatio(options map[string]any) string {

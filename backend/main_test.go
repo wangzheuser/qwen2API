@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -171,6 +172,35 @@ func TestUpstreamBusyDoesNotConsumeAccountQuota(t *testing.T) {
 	}
 	if status := upstreamMediaErrorStatus(err); status != 503 {
 		t.Fatalf("expected upstream congestion status 503, got %d", status)
+	}
+}
+
+// TestCompletionErrorPolicy 验证上游错误的重试、状态码和脱敏策略保持一致。
+func TestCompletionErrorPolicy(t *testing.T) {
+	busy := errors.New("Qwen upstream error code=quota_limit request_id=hidden details=目前服务访问量较大，请稍后再试。")
+	if !shouldRetryCompletion(CompletionResult{}, busy) {
+		t.Fatal("zero-event upstream congestion should retry")
+	}
+	if shouldRetryCompletion(CompletionResult{Events: []UpstreamEvent{{Type: "delta"}}}, busy) {
+		t.Fatal("an emitted upstream event must disable retry")
+	}
+	waf := errors.New("stream_chat blocked by Aliyun WAF")
+	if shouldRetryCompletion(CompletionResult{}, waf) {
+		t.Fatal("WAF rejection must not be retried immediately")
+	}
+	if status := completionErrorStatus(busy); status != http.StatusServiceUnavailable {
+		t.Fatalf("expected busy status 503, got %d", status)
+	}
+
+	invalid := errors.New("Qwen upstream error code=invalid_input request_id=hidden details=input invalid")
+	if shouldRetryCompletion(CompletionResult{}, invalid) {
+		t.Fatal("deterministic invalid input must not retry unchanged")
+	}
+	if status := completionErrorStatus(invalid); status != http.StatusUnprocessableEntity {
+		t.Fatalf("expected invalid input status 422, got %d", status)
+	}
+	if message := sanitizeClientErrorString(invalid.Error()); message != upstreamInvalidInputClientMessage {
+		t.Fatalf("invalid input details were not sanitized: %q", message)
 	}
 }
 

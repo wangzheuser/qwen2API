@@ -2126,7 +2126,7 @@ func LoadSettings() Settings {
 		AccountReadySetThreshold:               envInt("ACCOUNT_READY_SET_THRESHOLD", 128),
 		ChatDeleteRetryAttempts:                envInt("CHAT_DELETE_RETRY_ATTEMPTS", 3),
 		ChatDeleteRetryDelaySeconds:            envFloat("CHAT_DELETE_RETRY_DELAY_SECONDS", 0.5),
-		ChatIDPrewarmTargetPerAccount:          envInt("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5),
+		ChatIDPrewarmTargetPerAccount:          envInt("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 0),
 		ChatIDPrewarmTTLSeconds:                envInt("CHAT_ID_PREWARM_TTL_SECONDS", 120),
 		ChatIDPrewarmMaxConcurrency:            envInt("CHAT_ID_PREWARM_MAX_CONCURRENCY", 16),
 		TraceResponseFingerprints:              envBool("TRACE_RESPONSE_FINGERPRINTS", false),
@@ -3065,7 +3065,34 @@ func (app *App) acquireCompletionChat(ctx context.Context, req StandardRequest, 
 	return nil, "", false, lastErr
 }
 
+// runCompletionWithHooks 对尚未产生上游事件的瞬态错误执行一次退避重试。
 func (app *App) runCompletionWithHooks(ctx context.Context, req StandardRequest, preferredEmail string, hooks *completionStreamHooks) (CompletionResult, error) {
+	result, err := app.runCompletionAttemptWithHooks(ctx, req, preferredEmail, hooks)
+	if !shouldRetryCompletion(result, err) {
+		return result, err
+	}
+	app.logWarn(ctx, "上游零事件失败，准备退避重试", "error_code", firstNonEmpty(qwenUpstreamErrorCode(err), "transient"), "retry_after_ms", 500)
+	sleepWithContext(ctx, 500*time.Millisecond)
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	return app.runCompletionAttemptWithHooks(ctx, req, preferredEmail, hooks)
+}
+
+// shouldRetryCompletion 仅重试不会造成客户端重复输出的瞬态零事件失败。
+func shouldRetryCompletion(result CompletionResult, err error) bool {
+	if err == nil || len(result.Events) != 0 || result.AnswerText != "" || result.ReasoningText != "" || len(result.ToolCalls) != 0 {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if isUpstreamWAFErrorMessage(message) {
+		return false
+	}
+	return isUpstreamBusyErrorMessage(message) || isTransientUpstreamErrorMessage(message)
+}
+
+// runCompletionAttemptWithHooks 执行一次完整的账号获取、会话创建和流式收集。
+func (app *App) runCompletionAttemptWithHooks(ctx context.Context, req StandardRequest, preferredEmail string, hooks *completionStreamHooks) (CompletionResult, error) {
 	if req.BoundAccount != nil {
 		preferredEmail = req.BoundAccount.Email
 	}
@@ -5023,6 +5050,7 @@ func isUpstreamWAFErrorMessage(msg string) bool {
 	}
 	for _, marker := range []string{
 		"aliyun_waf",
+		"aliyun waf",
 		"aliyuncaptcha",
 		"cf_app_waf",
 		"fail_sys_user_validate",
@@ -5049,6 +5077,25 @@ func isUpstreamWAFErrorMessage(msg string) bool {
 	}
 	return (strings.Contains(lower, "<!doctype") || strings.Contains(lower, "<html")) &&
 		(strings.Contains(lower, "captcha") || strings.Contains(lower, "waf") || strings.Contains(lower, "access verification") || strings.Contains(lower, "访问验证"))
+}
+
+// upstreamResponseKind 返回可安全记录的上游响应类别，避免日志写入响应正文。
+func upstreamResponseKind(body string) string {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return "empty"
+	}
+	if isUpstreamWAFErrorMessage(trimmed) {
+		return "aliyun_waf"
+	}
+	if json.Valid([]byte(trimmed)) {
+		return "json"
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype html") {
+		return "html"
+	}
+	return "text"
 }
 
 func isTransientUpstreamErrorMessage(lower string) bool {
@@ -5114,6 +5161,42 @@ func isTransientUpstreamErrorMessage(lower string) bool {
 }
 
 const upstreamTemporaryClientMessage = "上游 Qwen 请求被网络超时、连接中断或 WAF 风控拦截；网关已按当前策略重试/切换账号但仍失败。请稍后重试，或在管理页刷新/复验账号后再试。"
+const upstreamInvalidInputClientMessage = "上游 Qwen 拒绝了当前请求格式；网关兼容处理后仍失败。请缩短上下文或减少工具定义后重试。"
+
+var qwenUpstreamErrorCodePattern = regexp.MustCompile(`(?i)\bcode=([a-z0-9_-]+)\b`)
+
+// qwenUpstreamErrorCode 提取上游稳定错误码，避免业务逻辑依赖完整错误文本。
+func qwenUpstreamErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	match := qwenUpstreamErrorCodePattern.FindStringSubmatch(err.Error())
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.ToLower(match[1])
+}
+
+// completionErrorStatus 把上游失败映射成可重试语义明确的 HTTP 状态。
+func completionErrorStatus(err error) int {
+	if err == nil {
+		return http.StatusInternalServerError
+	}
+	if errors.Is(err, context.Canceled) {
+		return 499
+	}
+	if qwenUpstreamErrorCode(err) == "invalid_input" {
+		return http.StatusUnprocessableEntity
+	}
+	lower := strings.ToLower(err.Error())
+	if isUpstreamBusyErrorMessage(lower) || isTransientUpstreamErrorMessage(lower) {
+		return http.StatusServiceUnavailable
+	}
+	if strings.Contains(lower, "qwen upstream error") || strings.Contains(lower, "stream_chat") {
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
+}
 
 func sanitizeClientErrorDetail(detail any) any {
 	switch v := detail.(type) {
@@ -5127,8 +5210,14 @@ func sanitizeClientErrorDetail(detail any) any {
 }
 
 func sanitizeClientErrorString(msg string) string {
+	if qwenUpstreamErrorCode(errors.New(msg)) == "invalid_input" {
+		return upstreamInvalidInputClientMessage
+	}
 	if shouldMaskUpstreamErrorMessage(msg) {
 		return upstreamTemporaryClientMessage
+	}
+	if strings.Contains(strings.ToLower(msg), "qwen upstream error") {
+		return "上游 Qwen 请求失败；请稍后重试。"
 	}
 	return msg
 }
@@ -5245,7 +5334,7 @@ func (app *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, completionErrorStatus(err), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, buildOpenAICompletionPayload(id, created, req, result))
@@ -5260,9 +5349,16 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 		return
 	}
 	flusher, _ := w.(http.Flusher)
-	_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"role": "assistant"}, nil)))
-	if flusher != nil {
-		flusher.Flush()
+	streamStarted := false
+	startStream := func() {
+		if streamStarted {
+			return
+		}
+		_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"role": "assistant"}, nil)))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		streamStarted = true
 	}
 	toolCallsSent := false
 	result, err := app.runCompletionWithHooks(r.Context(), req, "", &completionStreamHooks{
@@ -5270,6 +5366,7 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 			if delta == "" || toolCallsSent {
 				return nil
 			}
+			startStream()
 			_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"reasoning_content": delta}, nil)))
 			if flusher != nil {
 				flusher.Flush()
@@ -5280,6 +5377,7 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 			if delta == "" || toolCallsSent {
 				return nil
 			}
+			startStream()
 			_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"content": delta}, nil)))
 			if flusher != nil {
 				flusher.Flush()
@@ -5290,6 +5388,7 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 			if toolCallsSent {
 				return nil
 			}
+			startStream()
 			app.logParsedToolCalls(r.Context(), "ToolCall", "openai_stream_response", calls)
 			app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 			for idx, call := range openAIToolCalls(calls) {
@@ -5310,13 +5409,22 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 		},
 	})
 	if err != nil {
+		if !streamStarted {
+			writeError(w, completionErrorStatus(err), err)
+			return
+		}
 		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{"error": sanitizeClientErrorString(err.Error())}) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
 		return
 	}
 	if toolCallsSent {
 		return
 	}
 	if calls := completionToolCalls(result, req.Tools); len(calls) > 0 {
+		startStream()
 		app.logParsedToolCalls(r.Context(), "ToolCall", "openai_stream_response", calls)
 		app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 		for idx, call := range openAIToolCalls(calls) {
@@ -5334,6 +5442,7 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 		}
 		return
 	}
+	startStream()
 	if result.AnswerText == "" && result.ReasoningText == "" {
 		fallback := emptyCompletionFallback(req, CompletionResult{FinishReason: "empty"})
 		_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"content": fallback}, nil)))
@@ -5348,15 +5457,23 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 func (app *App) streamOpenAIBuffered(w http.ResponseWriter, r *http.Request, req StandardRequest, id string, created int64) {
 	flusher, _ := w.(http.Flusher)
 	toolCallsSent := false
-	_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"role": "assistant"}, nil)))
-	if flusher != nil {
-		flusher.Flush()
+	streamStarted := false
+	startStream := func() {
+		if streamStarted {
+			return
+		}
+		_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"role": "assistant"}, nil)))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		streamStarted = true
 	}
 	result, err := app.runCompletionWithHooks(r.Context(), req, "", &completionStreamHooks{
 		OnToolCalls: func(calls []ParsedToolCall) error {
 			if toolCallsSent {
 				return nil
 			}
+			startStream()
 			app.logParsedToolCalls(r.Context(), "ToolCall", "openai_stream_response", calls)
 			app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 			for idx, call := range openAIToolCalls(calls) {
@@ -5377,13 +5494,22 @@ func (app *App) streamOpenAIBuffered(w http.ResponseWriter, r *http.Request, req
 		},
 	})
 	if err != nil {
+		if !streamStarted {
+			writeError(w, completionErrorStatus(err), err)
+			return
+		}
 		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{"error": sanitizeClientErrorString(err.Error())}) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
 		return
 	}
 	if toolCallsSent {
 		return
 	}
 	if calls := completionToolCalls(result, req.Tools); len(calls) > 0 {
+		startStream()
 		app.logParsedToolCalls(r.Context(), "ToolCall", "openai_stream_response", calls)
 		app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 		for idx, call := range openAIToolCalls(calls) {
@@ -5396,6 +5522,7 @@ func (app *App) streamOpenAIBuffered(w http.ResponseWriter, r *http.Request, req
 		}
 		_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{}, "tool_calls")))
 	} else {
+		startStream()
 		if result.ReasoningText != "" {
 			_, _ = w.Write([]byte(openAIChunk(id, created, req.ResponseModel, map[string]any{"reasoning_content": result.ReasoningText}, nil)))
 		}
@@ -5536,7 +5663,7 @@ func (app *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, completionErrorStatus(err), err)
 		return
 	}
 	output := []map[string]any{}
@@ -5882,8 +6009,15 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	writeSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "status": "in_progress"}})
-	flushSSE(w)
+	streamStarted := false
+	startStream := func() {
+		if streamStarted {
+			return
+		}
+		writeSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "status": "in_progress"}})
+		flushSSE(w)
+		streamStarted = true
+	}
 
 	toolCallsSent := false
 	hooks := &completionStreamHooks{
@@ -5891,6 +6025,7 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 			if delta == "" || toolCallsSent {
 				return nil
 			}
+			startStream()
 			writeSSEEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "delta": delta})
 			flushSSE(w)
 			return nil
@@ -5899,6 +6034,7 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 			if !req.ToolEnabled || toolCallsSent {
 				return nil
 			}
+			startStream()
 			app.logParsedToolCalls(r.Context(), "ToolCall", "responses_stream_response", calls)
 			app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 			output := responsesToolItems(calls)
@@ -5917,6 +6053,10 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 
 	result, err := app.runCompletionWithHooks(r.Context(), req, "", hooks)
 	if err != nil {
+		if !streamStarted {
+			writeError(w, completionErrorStatus(err), err)
+			return
+		}
 		writeSSEEvent(w, "error", map[string]any{"type": "error", "error": sanitizeClientErrorString(err.Error())})
 		flushSSE(w)
 		return
@@ -5924,6 +6064,7 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 	if toolCallsSent {
 		return
 	}
+	startStream()
 	output := []map[string]any{}
 	outputText := result.AnswerText
 	if calls := completionToolCalls(result, req.Tools); len(calls) > 0 {
@@ -5995,7 +6136,7 @@ func (app *App) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) 
 	}
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, completionErrorStatus(err), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, app.buildAnthropicPayload(r.Context(), id, req.ResponseModel, req.Prompt, req, result, "json_response"))
@@ -6020,14 +6161,21 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	writeSSEEvent(w, "message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id": id, "type": "message", "role": "assistant", "content": []any{}, "model": req.ResponseModel, "stop_reason": nil,
-			"usage": map[string]any{"input_tokens": len(req.Prompt)},
-		},
-	})
-	flushSSE(w)
+	streamStarted := false
+	startStream := func() {
+		if streamStarted {
+			return
+		}
+		writeSSEEvent(w, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": id, "type": "message", "role": "assistant", "content": []any{}, "model": req.ResponseModel, "stop_reason": nil,
+				"usage": map[string]any{"input_tokens": len(req.Prompt)},
+			},
+		})
+		flushSSE(w)
+		streamStarted = true
+	}
 
 	activeBlockType := ""
 	activeBlockIndex := 0
@@ -6035,6 +6183,7 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 	emittedContent := false
 	messageStopped := false
 	startBlock := func(kind string) {
+		startStream()
 		if activeBlockType == kind {
 			return
 		}
@@ -6052,6 +6201,7 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 		emittedContent = true
 	}
 	stopMessage := func(stopReason string, outputTokens int) {
+		startStream()
 		if activeBlockType != "" {
 			writeSSEEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": activeBlockIndex})
 			activeBlockType = ""
@@ -6090,6 +6240,7 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 			if !req.ToolEnabled || toolCallsSent {
 				return nil
 			}
+			startStream()
 			app.logParsedToolCalls(r.Context(), "ToolCall", "stream_response", calls)
 			app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_use", "has_tool_use", true)
 			app.logParsedToolCalls(r.Context(), "ANT-ToolOut", "stream_response", calls)
@@ -6103,6 +6254,10 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 
 	result, err := app.runCompletionWithHooks(r.Context(), req, "", hooks)
 	if err != nil {
+		if !streamStarted {
+			writeError(w, completionErrorStatus(err), err)
+			return
+		}
 		writeSSEEvent(w, "error", map[string]any{"type": "error", "error": sanitizeClientErrorString(err.Error())})
 		flushSSE(w)
 		return
@@ -6110,6 +6265,7 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 	if toolCallsSent {
 		return
 	}
+	startStream()
 	if !req.ToolEnabled {
 		stopReason := "end_turn"
 		outputTokens := len(result.AnswerText)
@@ -6174,7 +6330,7 @@ func (app *App) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 	app.recordStandardRequest(r.Context(), req)
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, completionErrorStatus(err), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, geminiPayload(result.AnswerText))
@@ -6200,7 +6356,7 @@ func (app *App) handleGeminiStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
-		_, _ = w.Write([]byte(mustJSON(map[string]any{"error": sanitizeClientErrorString(err.Error())}) + "\n"))
+		writeError(w, completionErrorStatus(err), err)
 		return
 	}
 	_, _ = w.Write([]byte(mustJSON(geminiPayload(result.AnswerText)) + "\n"))
@@ -7066,7 +7222,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			if status != http.StatusOK {
 				lastErr = fmt.Errorf("video completion HTTP %d: %s", status, truncate(body, 500))
 				app.classifyAccountErrorFor(acc, lastErr, accountUsageVideo)
-				app.logWarn(ctx, "视频生成上游状态异常", "attempt", attempt+1, "status", status, "body", truncate(body, 240))
+				app.logWarn(ctx, "视频生成上游状态异常", "attempt", attempt+1, "status", status, "body_kind", upstreamResponseKind(body))
 				return
 			}
 			answerText := body
@@ -9351,7 +9507,7 @@ func (c *QwenClient) requestJSONForIdentity(ctx context.Context, method, path st
 	raw, _ := io.ReadAll(resp.Body)
 	attrs := []any{"method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "bytes", len(raw), "duration_ms", time.Since(start).Milliseconds()}
 	if resp.StatusCode >= 400 {
-		attrs = append(attrs, "body", truncate(string(raw), 240))
+		attrs = append(attrs, "body_kind", upstreamResponseKind(string(raw)))
 		logWarn(c.logger, ctx, "上游请求完成", attrs...)
 	} else {
 		logInfo(c.logger, ctx, "上游请求完成", attrs...)
@@ -9381,6 +9537,9 @@ func (c *QwenClient) CreateChatForIdentity(ctx context.Context, identity QwenReq
 		logWarn(c.logger, ctx, "创建上游会话请求失败", "model", model, "chat_type", chatType, "error", err)
 		return "", err
 	}
+	if isUpstreamWAFErrorMessage(text) {
+		return "", errors.New("create_chat blocked by Aliyun WAF")
+	}
 	if status != http.StatusOK {
 		lower := strings.ToLower(text)
 		if status == 401 || status == 403 || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "forbidden") || strings.Contains(lower, "token") || strings.Contains(lower, "login") {
@@ -9390,9 +9549,6 @@ func (c *QwenClient) CreateChatForIdentity(ctx context.Context, identity QwenReq
 			return "", errors.New("429 Too Many Requests")
 		}
 		return "", fmt.Errorf("create_chat HTTP %d: %s", status, truncate(text, 200))
-	}
-	if isUpstreamWAFErrorMessage(text) {
-		return "", fmt.Errorf("create_chat blocked by Aliyun WAF: %s", truncate(text, 200))
 	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
@@ -9426,7 +9582,7 @@ func (c *QwenClient) DeleteChat(ctx context.Context, token, chatID string) bool 
 			logInfo(c.logger, ctx, "删除上游会话完成", "chat_id", chatID, "attempt", attempt, "status", status)
 			return true
 		}
-		logWarn(c.logger, ctx, "删除上游会话失败", "chat_id", chatID, "attempt", attempt, "status", status, "error", err, "body", truncate(text, 120))
+		logWarn(c.logger, ctx, "删除上游会话失败", "chat_id", chatID, "attempt", attempt, "status", status, "error", err, "body_kind", upstreamResponseKind(text))
 		time.Sleep(time.Duration(c.settings.ChatDeleteRetryDelaySeconds*float64(attempt)*1000) * time.Millisecond)
 	}
 	return false
@@ -9468,14 +9624,17 @@ func (c *QwenClient) StreamChatForIdentity(ctx context.Context, identity QwenReq
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		logWarn(c.logger, ctx, "上游流式返回错误", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body", truncate(string(body), 240))
+		logWarn(c.logger, ctx, "上游流式返回错误", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body_kind", upstreamResponseKind(string(body)))
+		if isUpstreamWAFErrorMessage(string(body)) {
+			return errors.New("stream_chat blocked by Aliyun WAF")
+		}
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 800))
 	}
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
 		body, _ := io.ReadAll(resp.Body)
-		logWarn(c.logger, ctx, "上游流式返回 HTML", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body", truncate(string(body), 240))
+		logWarn(c.logger, ctx, "上游流式返回 HTML", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body_kind", upstreamResponseKind(string(body)))
 		if isUpstreamWAFErrorMessage(string(body)) {
-			return fmt.Errorf("stream_chat blocked by Aliyun WAF: %s", truncate(string(body), 200))
+			return errors.New("stream_chat blocked by Aliyun WAF")
 		}
 		return fmt.Errorf("stream_chat unexpected HTML response: %s", truncate(string(body), 200))
 	}
@@ -9578,9 +9737,9 @@ func (c *QwenClient) StreamChatForIdentity(ctx context.Context, identity QwenReq
 						if upstreamError := upstream.ExtractUpstreamError(rawTail); upstreamError != "" {
 							return errors.New(upstreamError)
 						}
-						logWarn(c.logger, ctx, "上游 SSE 未解析到有效 delta", "chat_id", chatID, "stream_bytes", totalBytes, "raw_tail", truncate(rawTail, 500))
+						logWarn(c.logger, ctx, "上游 SSE 未解析到有效 delta", "chat_id", chatID, "stream_bytes", totalBytes, "body_kind", upstreamResponseKind(rawTail))
 						if isUpstreamWAFErrorMessage(rawTail) {
-							return fmt.Errorf("stream_chat blocked by Aliyun WAF: %s", truncate(rawTail, 200))
+							return errors.New("stream_chat blocked by Aliyun WAF")
 						}
 					}
 					return nil
@@ -9589,11 +9748,11 @@ func (c *QwenClient) StreamChatForIdentity(ctx context.Context, identity QwenReq
 			}
 		case <-firstEventCh:
 			cancel()
-			logWarn(c.logger, ctx, "上游流式首事件超时", "chat_id", chatID, "timeout_seconds", int(firstEventTimeout/time.Second), "duration_ms", time.Since(start).Milliseconds(), "stream_bytes", totalBytes, "raw_tail", truncate(rawTail, 500))
+			logWarn(c.logger, ctx, "上游流式首事件超时", "chat_id", chatID, "timeout_seconds", int(firstEventTimeout/time.Second), "duration_ms", time.Since(start).Milliseconds(), "stream_bytes", totalBytes, "body_kind", upstreamResponseKind(rawTail))
 			return fmt.Errorf("upstream stream first event timeout after %s without parsed SSE event", firstEventTimeout)
 		case <-idleCh:
 			cancel()
-			logWarn(c.logger, ctx, "上游流式空闲超时", "chat_id", chatID, "timeout_seconds", int(idleTimeout/time.Second), "events", events, "duration_ms", time.Since(start).Milliseconds(), "stream_bytes", totalBytes, "raw_tail", truncate(rawTail, 500))
+			logWarn(c.logger, ctx, "上游流式空闲超时", "chat_id", chatID, "timeout_seconds", int(idleTimeout/time.Second), "events", events, "duration_ms", time.Since(start).Milliseconds(), "stream_bytes", totalBytes, "body_kind", upstreamResponseKind(rawTail))
 			return fmt.Errorf("upstream stream idle timeout after %s without parsed SSE event", idleTimeout)
 		case <-streamCtx.Done():
 			return streamCtx.Err()
@@ -9639,13 +9798,13 @@ func (c *QwenClient) PostChatCompletionOnceForIdentity(ctx context.Context, iden
 	body, _ := io.ReadAll(resp.Body)
 	attrs := []any{"chat_id", chatID, "status", resp.StatusCode, "bytes", len(body), "duration_ms", time.Since(start).Milliseconds()}
 	if resp.StatusCode >= 400 {
-		attrs = append(attrs, "body", truncate(string(body), 240))
+		attrs = append(attrs, "body_kind", upstreamResponseKind(string(body)))
 		logWarn(c.logger, ctx, "上游非流式请求完成", attrs...)
 	} else {
 		logInfo(c.logger, ctx, "上游非流式请求完成", attrs...)
 	}
-	if resp.StatusCode == http.StatusOK && isUpstreamWAFErrorMessage(string(body)) {
-		return resp.StatusCode, string(body), fmt.Errorf("chat completion blocked by Aliyun WAF: %s", truncate(string(body), 200))
+	if isUpstreamWAFErrorMessage(string(body)) {
+		return resp.StatusCode, string(body), errors.New("chat completion blocked by Aliyun WAF")
 	}
 	return resp.StatusCode, string(body), nil
 }
@@ -9701,7 +9860,7 @@ func (c *QwenClient) ListChatsForIdentity(ctx context.Context, identity QwenRequ
 		return nil, err
 	}
 	if status != http.StatusOK {
-		logWarn(c.logger, ctx, "查询上游会话列表状态异常", "limit", limit, "status", status, "body", truncate(text, 240))
+		logWarn(c.logger, ctx, "查询上游会话列表状态异常", "limit", limit, "status", status, "body_kind", upstreamResponseKind(text))
 		return nil, fmt.Errorf("list_chats HTTP %d: %s", status, truncate(text, 200))
 	}
 	var payload map[string]any
@@ -9733,7 +9892,7 @@ func (c *QwenClient) ListModelsFromPool(ctx context.Context) ([]map[string]any, 
 			logWarn(c.logger, ctx, "拉取上游模型请求失败", "account", acc.Email, "error", err)
 			return nil, err
 		} else {
-			logWarn(c.logger, ctx, "拉取上游模型状态异常", "account", acc.Email, "status", status, "body", truncate(text, 240))
+			logWarn(c.logger, ctx, "拉取上游模型状态异常", "account", acc.Email, "status", status, "body_kind", upstreamResponseKind(text))
 			return nil, fmt.Errorf("list_models HTTP %d: %s", status, truncate(text, 200))
 		}
 	}
@@ -9774,8 +9933,8 @@ func (c *QwenClient) VerifyTokenDetailForIdentity(ctx context.Context, identity 
 	}
 	lower := strings.ToLower(text)
 	if isUpstreamWAFErrorMessage(text) {
-		result := TokenVerifyResult{StatusCode: "network_error", Error: fmt.Sprintf("WAF blocked: %s", truncate(text, 200))}
-		logWarn(c.logger, ctx, "账号 Token 验证被上游 WAF 拦截", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status, "body", truncate(text, 240))
+		result := TokenVerifyResult{StatusCode: "network_error", Error: "WAF blocked"}
+		logWarn(c.logger, ctx, "账号 Token 验证被上游 WAF 拦截", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status, "body_kind", upstreamResponseKind(text))
 		return result
 	}
 	if status >= 200 && status < 300 && !strings.Contains(lower, "unauthorized") {
@@ -9792,7 +9951,7 @@ func (c *QwenClient) VerifyTokenDetailForIdentity(ctx context.Context, identity 
 		statusCode = "banned"
 	}
 	result := TokenVerifyResult{StatusCode: statusCode, Error: fmt.Sprintf("HTTP %d: %s", status, truncate(text, 200))}
-	logWarn(c.logger, ctx, "账号 Token 验证失败", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status, "status_code", statusCode, "body", truncate(text, 240))
+	logWarn(c.logger, ctx, "账号 Token 验证失败", "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "status", status, "status_code", statusCode, "body_kind", upstreamResponseKind(text))
 	return result
 }
 
