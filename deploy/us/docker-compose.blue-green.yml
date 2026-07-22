@@ -1,0 +1,7 @@
+services:
+  qwen2api:
+    container_name: "qwen2api-${DEPLOY_SLOT}"
+    ports: !override
+      - "${BLUE_GREEN_BIND_ADDRESS:-172.17.0.1}:${DEPLOY_PORT}:${PORT:-7860}"
+    environment:
+      TOKEN_REFRESH_INITIAL_DELAY_SECONDS: "${TOKEN_REFRESH_INITIAL_DELAY_SECONDS:-180}"

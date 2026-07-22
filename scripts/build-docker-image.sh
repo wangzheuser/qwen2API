@@ -19,7 +19,8 @@ docker buildx build \
   "${ROOT_DIR}"
 
 OUTPUT="${OUTPUT:-/tmp/qwen2api-${IMAGE_TAG}.tar}"
-docker save "qwen2api:${IMAGE_TAG}" -o "${OUTPUT}"
-
 printf 'image=%s\n' "qwen2api:${IMAGE_TAG}"
-printf 'tar=%s\n' "${OUTPUT}"
+if [[ "${SAVE_TAR:-false}" == "true" ]]; then
+  docker save "qwen2api:${IMAGE_TAG}" -o "${OUTPUT}"
+  printf 'tar=%s\n' "${OUTPUT}"
+fi

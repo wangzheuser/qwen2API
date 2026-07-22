@@ -1,162 +1,134 @@
-# US Docker Compose 部署方案
+# US Docker Compose 蓝绿部署方案
 
-本文档说明如何把 us 服务器上的 qwen2api 从 host binary 部署迁移到 Docker Compose 部署。
+us 生产服务器只负责加载镜像和启动容器，禁止执行源码构建。镜像必须在本地构建、导出、压缩后上传。
 
-## 当前目标
+## 拓扑
 
-- 使用当前 Go 版 qwen2api 镜像运行服务。
-- 继续复用服务器上的 `/opt/docker_projects/qwen2api/data` 和 `/opt/docker_projects/qwen2api/logs`。
-- 继续监听宿主机 `7860`，保持 nginx-proxy 现有 `qwen2api.codeai.de5.net -> host.docker.internal:7860` 配置不变。
-- 不把真实 `.env.compose`、API Key、账号 token、Cookie、镜像 tar 提交到 Git。
+- blue：`172.17.0.1:17861`
+- green：`172.17.0.1:17862`
+- `nginx-proxy`：把 `qwen2api.codeai.de5.net` 切换到当前活动端口
+- 数据和日志：继续挂载 `/opt/docker_projects/qwen2api/data`、`/opt/docker_projects/qwen2api/logs`
 
-## Git 安全规则
+候选容器健康后才修改 nginx；公网验证通过后停止旧容器。失败时恢复 nginx 配置并停止候选容器。候选容器延迟 180 秒启动 token 刷新任务，避免蓝绿短暂并行期间同时写账号文件。
 
-只提交模板和脚本：
+## Git 安全
+
+可提交的部署文件：
 
 - `deploy/us/docker-compose.yml`
+- `deploy/us/docker-compose.blue-green.yml`
 - `deploy/us/docker-compose.smoke.yml`
 - `deploy/us/.env.compose.example`
 - `scripts/build-docker-image.sh`
+- `scripts/deploy-us-image.sh`
 - `scripts/render-compose-env.py`
-- `docs/deploy-us-docker-compose.md`
 
-禁止提交：
+禁止提交 `.env*`、`data/`、`logs/`、镜像归档、API Key、账号 token、Cookie、密码和私钥。
 
-- `.env.compose`
-- `.env.host-dev-go`
-- `.env`
-- `data/`
-- `logs/`
-- `*.tar`
-- `*.tar.gz`
-
-提交前必须检查：
+提交前检查：
 
 ```bash
 git status --short
-git diff --cached --name-only
 git diff --cached
-git check-ignore -v ".env.compose" ".env.host-dev-go" ".env" || true
-```
-
-如果安装了 gitleaks，额外执行：
-
-```bash
+git check-ignore -v .env .env.compose || true
 gitleaks detect --source . --redact
 ```
 
-## 构建镜像
+## 本地构建与部署
 
-在本地项目根目录执行：
-
-```bash
-scripts/build-docker-image.sh
-```
-
-脚本默认构建：
-
-- 平台：`linux/amd64`
-- 镜像：`qwen2api:dev-go-<git短提交>`
-- 导出：`/tmp/qwen2api-dev-go-<git短提交>.tar`
-
-可选环境变量：
-
-- `GOPROXY`：Go 模块代理，默认 `https://goproxy.cn,direct`。
-- `INSTALL_BROWSERS`：是否在镜像构建阶段安装 Chromium，默认 `true`。
-- `PLAYWRIGHT_VERSION`：用于生成 playwright-go driver 目录的 `playwright-core` 版本，默认 `1.57.0`。
-
-说明：`playwright-go v0.5700.1` 需要 `1.57.0` driver。为避免 Playwright driver zip 暂不可用导致构建失败，Dockerfile 会从 npm 的 `playwright-core` 准备 driver 目录，再执行 Chromium 安装。
-
-## 上传并加载镜像
-
-把 tar 上传到 us 后执行：
+构建机需要 Docker、`zstd`、SSH，并至少预留 8–12GB 可用空间。配置 SSH alias `us` 后执行：
 
 ```bash
-docker load -i /tmp/qwen2api-dev-go-<git短提交>.tar
+CONFIRM_PRODUCTION_DEPLOY=yes scripts/deploy-us-image.sh
 ```
 
-加载完成后删除 tar，避免占用磁盘。
-
-## 生成服务器 .env.compose
-
-在 us 上基于当前 host env 渲染容器路径：
+显式指定标签：
 
 ```bash
-python3 scripts/render-compose-env.py \
-  --source /opt/docker_projects/qwen2api/.env.host-dev-go \
-  --output /opt/docker_projects/qwen2api/.env.compose \
-  --image-tag dev-go-<git短提交>
-
-chmod 600 /opt/docker_projects/qwen2api/.env.compose
+CONFIRM_PRODUCTION_DEPLOY=yes scripts/deploy-us-image.sh dev-go-<git短提交>
 ```
 
-容器内路径必须是 `/app/...`，不要使用 `/opt/docker_projects/...`。
-
-## 临时端口 smoke test
-
-先不占用生产 `7860`：
-
-`docker-compose.smoke.yml` 使用 Compose `!override` 显式替换 `ports` 和 `volumes`，
-避免临时 smoke 容器继承生产 `7860` 端口映射。
+没有 SSH alias 时：
 
 ```bash
-cd /opt/docker_projects/qwen2api
-docker compose \
-  --env-file .env.compose \
-  -f docker-compose.yml \
-  -f docker-compose.smoke.yml \
-  up -d
-
-curl -fsS http://127.0.0.1:17860/healthz
-curl -fsS http://127.0.0.1:17860/ | head
-docker compose -f docker-compose.yml -f docker-compose.smoke.yml down
+US_SSH_TARGET=root@example.com \
+US_SSH_PORT=22 \
+CONFIRM_PRODUCTION_DEPLOY=yes \
+scripts/deploy-us-image.sh
 ```
 
-## 正式切换
+脚本按以下顺序执行：
 
-切换前确认可回滚：
+1. 本地构建 `linux/amd64` 镜像。
+2. 本地以流式方式执行 `docker save | zstd`，避免同时占用 tar 和压缩包两份磁盘空间。
+3. 把压缩镜像拆成小分片逐个 SCP 上传，并在 us 合并；单次连接中断不会产生不可识别的半包镜像。
+4. us 执行 `docker load`，立即删除上传归档。
+5. 在非活动槽启动候选容器并检查 `/healthz`。
+6. 备份 nginx 配置、修改 qwen2api server block、执行 `nginx -t` 和 reload。
+7. 验证公网 `/healthz`；失败自动恢复 nginx 并停止候选容器。
+8. 验证成功后记录活动槽、停止旧容器并删除临时 nginx 备份。
+9. 本地退出时删除构建归档。
 
-- `/opt/docker_projects/qwen2api/current-src`
-- `/opt/docker_projects/qwen2api/.env.host-dev-go`
-- `/opt/docker_projects/qwen2api/run-dev-go-host.sh`
+认证由 SSH config、ssh-agent 或调用者环境提供，不得写入脚本或 Git。
 
-切换步骤：
+## 可选参数
+
+```text
+US_DEPLOY_DIR=/opt/docker_projects/qwen2api
+US_BLUE_PORT=17861
+US_GREEN_PORT=17862
+US_PROXY_CONFIG=/opt/docker_projects/nginx-proxy/nginx.conf
+US_PROXY_CONTAINER=nginx-proxy
+US_PUBLIC_HEALTH_URL=https://qwen2api.codeai.de5.net/healthz
+UPLOAD_CHUNK_SIZE=32m
+```
+
+若目标标签镜像已经在本地构建完成，可跳过重复构建和远端镜像元数据请求：
 
 ```bash
-kill "$(cat /opt/docker_projects/qwen2api/dev-go-host.pid)"
-ss -lntp | grep ':7860' || true
-
-cd /opt/docker_projects/qwen2api
-docker compose --env-file .env.compose up -d
+SKIP_LOCAL_BUILD=true \
+CONFIRM_PRODUCTION_DEPLOY=yes \
+scripts/deploy-us-image.sh dev-go-<git短提交>
 ```
 
-## 验证
+## 手动验证
 
 ```bash
-curl -fsS http://127.0.0.1:7860/healthz
-docker compose --env-file .env.compose ps
-docker logs --tail=100 qwen2api
+cat /opt/docker_projects/qwen2api/.active-slot
+docker ps --filter name=qwen2api-
+docker exec nginx-proxy nginx -t
+curl -fsS https://qwen2api.codeai.de5.net/healthz
 ```
 
-还必须验证：
+切换后还应真实验证 OpenAI、Responses、Anthropic 三种 LLM 协议，以及图片和视频端点。
 
-- API 文生视频 T2V。
-- API 首帧图生视频 I2V。
-- 页面文生视频。
-- 页面首帧图生视频。
-- nginx 域名访问。
+## 手动回滚
 
-## 回滚
-
-如果 compose 失败：
+假设需要回滚到 blue：
 
 ```bash
-cd /opt/docker_projects/qwen2api
-docker compose --env-file .env.compose down
-
-nohup /opt/docker_projects/qwen2api/run-dev-go-host.sh \
-  >> /opt/docker_projects/qwen2api/logs/dev-go-host.log 2>&1 &
-
-echo $! > /opt/docker_projects/qwen2api/dev-go-host.pid
-curl -fsS http://127.0.0.1:7860/healthz
+docker start qwen2api-blue
+curl -fsS http://172.17.0.1:17861/healthz
 ```
+
+确认 blue 健康后，仅把 nginx 中 qwen2api server block 的两处 `proxy_pass` 改为：
+
+```nginx
+proxy_pass http://host.docker.internal:17861;
+```
+
+然后执行：
+
+```bash
+docker exec nginx-proxy nginx -t
+docker exec nginx-proxy nginx -s reload
+curl -fsS https://qwen2api.codeai.de5.net/healthz
+printf 'blue\n' > /opt/docker_projects/qwen2api/.active-slot
+docker stop qwen2api-green
+```
+
+回滚到 green 时使用端口 `17862`，步骤相同。
+
+## 数据一致性边界
+
+当前服务使用本地 JSON 文件保存账号状态，不适合两个实例长期同时处理流量。蓝绿重叠仅用于启动和健康检查，切流成功后立即停止旧槽；部署窗口内不要执行账号批量导入、删除或管理端写操作。若未来需要长期双活，应先迁移到支持并发写入的数据库。

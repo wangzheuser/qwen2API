@@ -56,25 +56,26 @@ type App struct {
 	managedAPIKeys map[string]bool
 	envAPIKeys     map[string]bool
 
-	usersStore        *JSONStore
-	accountsStore     *JSONStore
-	capturesStore     *JSONStore
-	configStore       *JSONStore
-	contextCacheStore *JSONStore
-	uploadedFileStore *JSONStore
-	sessionStore      *JSONStore
-	fileContentCache  *fileContentCache
-	keepalive         *KeepAliveService
-	tokenRefresh      *TokenRefreshService
-	videoTasks        map[string]*VideoTask
-	videoTasksMu      sync.RWMutex
-	mediaSlots        chan struct{}
-	mediaPaceMu       sync.Mutex
-	lastMediaStarted  time.Time
-	mediaRefreshMu    sync.Mutex
-	mediaWAFMu        sync.Mutex
-	mediaWAFUntil     time.Time
-	mediaWAFLastError string
+	usersStore            *JSONStore
+	accountsStore         *JSONStore
+	capturesStore         *JSONStore
+	configStore           *JSONStore
+	contextCacheStore     *JSONStore
+	uploadedFileStore     *JSONStore
+	sessionStore          *JSONStore
+	fileContentCache      *fileContentCache
+	keepalive             *KeepAliveService
+	tokenRefresh          *TokenRefreshService
+	videoTasks            map[string]*VideoTask
+	videoTasksMu          sync.RWMutex
+	mediaSlots            chan struct{}
+	mediaPaceMu           sync.Mutex
+	lastMediaStarted      time.Time
+	mediaRefreshMu        sync.Mutex
+	mediaCircuitMu        sync.Mutex
+	mediaCircuitUntil     time.Time
+	mediaCircuitLastError string
+	mediaCircuitReason    string
 }
 
 func main() {
@@ -484,6 +485,18 @@ func (p *AccountPool) HasCookieBackedAvailableFor(usage string) bool {
 			continue
 		}
 		if acc.availableFor(p.settings, usage) && acc.Inflight < p.maxInflightPerAccount {
+			return true
+		}
+	}
+	return false
+}
+
+// HasCookieBackedAccount 判断账号池是否已经具备可恢复使用的媒体账号。
+func (p *AccountPool) HasCookieBackedAccount() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, acc := range p.accounts {
+		if acc != nil && acc.Valid && acc.Token != "" && strings.TrimSpace(acc.Cookies) != "" {
 			return true
 		}
 	}
@@ -2047,6 +2060,7 @@ type Settings struct {
 	KeepAliveURL                           string
 	KeepAliveInterval                      int
 	TokenRefreshEnabled                    bool
+	TokenRefreshInitialDelaySeconds        int
 	TokenRefreshCheckInterval              int
 	TokenRefreshAheadSeconds               int
 	TokenRefreshStaggerMS                  int
@@ -2121,6 +2135,7 @@ func LoadSettings() Settings {
 		KeepAliveURL:                           envString("KEEPALIVE_URL", ""),
 		KeepAliveInterval:                      clampInt(envInt("KEEPALIVE_INTERVAL", keepAliveDefaultInterval), keepAliveMinInterval, keepAliveMaxInterval),
 		TokenRefreshEnabled:                    envBool("TOKEN_REFRESH_ENABLED", true),
+		TokenRefreshInitialDelaySeconds:        maxInt(envInt("TOKEN_REFRESH_INITIAL_DELAY_SECONDS", 0), 0),
 		TokenRefreshCheckInterval:              envInt("TOKEN_REFRESH_CHECK_INTERVAL", 21600),
 		TokenRefreshAheadSeconds:               envInt("TOKEN_REFRESH_AHEAD_SECONDS", 259200),
 		TokenRefreshStaggerMS:                  envInt("TOKEN_REFRESH_STAGGER_MS", 2000),
@@ -2672,6 +2687,15 @@ func (s *TokenRefreshService) run(ctx context.Context) {
 	interval := time.Duration(s.app.settings.TokenRefreshCheckInterval) * time.Second
 	stagger := time.Duration(s.app.settings.TokenRefreshStaggerMS) * time.Millisecond
 	ahead := float64(s.app.settings.TokenRefreshAheadSeconds)
+	if delay := time.Duration(s.app.settings.TokenRefreshInitialDelaySeconds) * time.Second; delay > 0 {
+		if s.logger != nil {
+			s.logger.Info("token 主动刷新等待启动", "delay_s", s.app.settings.TokenRefreshInitialDelaySeconds)
+		}
+		sleepWithContext(ctx, delay)
+		if ctx.Err() != nil {
+			return
+		}
+	}
 	if s.logger != nil {
 		s.logger.Info("token 主动刷新任务启动", "interval_s", s.app.settings.TokenRefreshCheckInterval, "ahead_s", s.app.settings.TokenRefreshAheadSeconds)
 	}
@@ -4812,6 +4836,16 @@ func (app *App) classifyAccountErrorFor(acc *Account, err error, usage string) {
 	}
 	msg := err.Error()
 	lower := strings.ToLower(msg)
+	if isUpstreamBusyErrorMessage(lower) {
+		normalizedUsage := normalizeAccountUsage(usage)
+		if normalizedUsage == accountUsageImage || normalizedUsage == accountUsageVideo {
+			app.tripMediaCircuit(err, "upstream_busy", transientUpstreamCooldownSeconds(app.settings))
+		}
+		if app.logger != nil {
+			app.logger.Warn("上游服务拥堵，未标记账号限额", "usage", normalizedUsage, "error", truncate(msg, 240))
+		}
+		return
+	}
 	if isRateLimitErrorMessage(lower) {
 		usage = normalizeAccountUsage(usage)
 		app.accounts.MarkRateLimitedFor(acc, usage, app.accountErrorCooldown(lower), msg)
@@ -4830,6 +4864,7 @@ func (app *App) classifyAccountErrorFor(acc *Account, err error, usage string) {
 		normalizedUsage := normalizeAccountUsage(usage)
 		if normalizedUsage == accountUsageImage || normalizedUsage == accountUsageVideo {
 			app.accounts.MarkRateLimitedFor(acc, normalizedUsage, app.settings.MediaWAFBreakerCooldownSeconds, msg)
+			app.tripMediaCircuit(err, "waf", app.settings.MediaWAFBreakerCooldownSeconds)
 		}
 		if app.logger != nil {
 			app.logger.Warn("上游 WAF 风控拦截，账号进入分用途冷却", "account", acc.Email, "usage", normalizedUsage, "error", truncate(msg, 240))
@@ -4873,6 +4908,9 @@ func rateLimitCooldownSeconds(settings Settings, lower string) int {
 
 func isRateLimitErrorMessage(lower string) bool {
 	lower = strings.ToLower(lower)
+	if isUpstreamBusyErrorMessage(lower) {
+		return false
+	}
 	if strings.Contains(lower, "http 429") ||
 		strings.Contains(lower, "status 429") ||
 		strings.Contains(lower, "status=429") ||
@@ -4895,6 +4933,24 @@ func isRateLimitErrorMessage(lower string) bool {
 		"quota",
 		"free quota",
 		"insufficient quota",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUpstreamBusyErrorMessage 区分服务拥堵和账号额度耗尽，避免无效轮换账号。
+func isUpstreamBusyErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, marker := range []string{
+		"目前服务访问量较大",
+		"服务访问量较大",
+		"server busy",
+		"service busy",
+		"server overloaded",
+		"service overloaded",
 	} {
 		if strings.Contains(lower, marker) {
 			return true
@@ -4999,6 +5055,9 @@ func isTransientUpstreamErrorMessage(lower string) bool {
 	lower = strings.ToLower(lower)
 	if strings.TrimSpace(lower) == "" {
 		return false
+	}
+	if isUpstreamBusyErrorMessage(lower) {
+		return true
 	}
 	if strings.Contains(lower, "http 500") ||
 		strings.Contains(lower, "http 502") ||
@@ -6322,7 +6381,11 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 
 	result, lastErr := app.generateImageData(r.Context(), requestData)
 	if lastErr != nil {
-		app.logWarn(r.Context(), "图片生成失败", "error", lastErr)
+		if errors.Is(lastErr, context.Canceled) {
+			app.logInfo(r.Context(), "图片生成请求已取消")
+		} else {
+			app.logWarn(r.Context(), "图片生成失败", "error", lastErr)
+		}
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
 		return
 	}
@@ -6360,7 +6423,7 @@ func (app *App) generateImageData(ctx context.Context, requestData map[string]an
 
 func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any) ([]string, error) {
 	var lastErr error
-	if err := app.mediaWAFCircuitError(); err != nil {
+	if err := app.mediaCircuitError(); err != nil {
 		return nil, err
 	}
 	releaseMediaSlot, err := app.acquireMediaSlot(ctx)
@@ -6415,6 +6478,10 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				}
 				return nil
 			}); err != nil {
+				if ctx.Err() != nil {
+					lastErr = ctx.Err()
+					return
+				}
 				app.classifyAccountErrorFor(acc, err, accountUsageImage)
 				lastErr = err
 				app.logWarn(ctx, "图片生成上游流式失败", "attempt", attempt+1, "error", err, "parts", len(parts))
@@ -6452,21 +6519,20 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			imageOptions["urls"] = urls
 			app.logInfo(ctx, "图片生成尝试成功", "attempt", attempt+1, "url_count", len(urls))
 		}()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if lastErr == nil {
 			if urls, ok := imageOptions["urls"].([]string); ok {
 				return urls, nil
 			}
 		}
 		app.logWarn(ctx, "图片生成尝试失败", "attempt", attempt+1, "error", lastErr)
-		if shouldSwitchMediaAccount(lastErr) {
-			if app.accounts.HasCookieBackedAvailableFor(accountUsageImage) || app.ensureMediaCookieAccount(ctx, accountUsageImage) {
-				attempts = min(attempts+1, 20)
-				continue
-			}
+		if isUpstreamBusyErrorMessage(lastErr.Error()) || isUpstreamWAFErrorMessage(lastErr.Error()) {
+			return nil, lastErr
 		}
 		if !app.accounts.HasCookieBackedAvailableFor(accountUsageImage) {
-			if app.ensureMediaCookieAccount(ctx, accountUsageImage) {
-				attempts = min(attempts+1, 20)
+			if attempt+1 < attempts && app.ensureMediaCookieAccount(ctx, accountUsageImage) {
 				continue
 			}
 			app.logWarn(ctx, "图片生成账号池已无可用 Cookie 账号", "attempt", attempt+1, "error", lastErr)
@@ -6796,7 +6862,11 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 
 	result, lastErr := app.generateVideoData(r.Context(), requestData)
 	if lastErr != nil {
-		app.logWarn(r.Context(), "视频生成失败", "error", lastErr)
+		if errors.Is(lastErr, context.Canceled) {
+			app.logInfo(r.Context(), "视频生成请求已取消")
+		} else {
+			app.logWarn(r.Context(), "视频生成失败", "error", lastErr)
+		}
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
 		return
 	}
@@ -6910,7 +6980,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 	if generationChatType == "" {
 		generationChatType = "t2v"
 	}
-	if err := app.mediaWAFCircuitError(); err != nil {
+	if err := app.mediaCircuitError(); err != nil {
 		return nil, err
 	}
 	releaseMediaSlot, err := app.acquireMediaSlot(ctx)
@@ -6984,6 +7054,10 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			payload["stream"] = false
 			status, body, err := app.client.PostChatCompletionOnceForAccount(ctx, acc, chatID, payload, 90*time.Second)
 			if err != nil {
+				if ctx.Err() != nil {
+					lastErr = ctx.Err()
+					return
+				}
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
 				app.logWarn(ctx, "视频生成上游请求失败", "attempt", attempt+1, "error", err)
@@ -7033,21 +7107,20 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			videoOptions["urls"] = urls
 			app.logInfo(ctx, "视频生成尝试成功", "attempt", attempt+1, "url_count", len(urls))
 		}()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if lastErr == nil {
 			if urls, ok := videoOptions["urls"].([]string); ok {
 				return urls, nil
 			}
 		}
 		app.logWarn(ctx, "视频生成尝试失败", "attempt", attempt+1, "error", lastErr)
-		if shouldSwitchMediaAccount(lastErr) {
-			if app.accounts.HasCookieBackedAvailableFor(accountUsageVideo) || app.ensureMediaCookieAccount(ctx, accountUsageVideo) {
-				attempts = min(attempts+1, 20)
-				continue
-			}
+		if isUpstreamBusyErrorMessage(lastErr.Error()) || isUpstreamWAFErrorMessage(lastErr.Error()) {
+			return nil, lastErr
 		}
 		if !app.accounts.HasCookieBackedAvailableFor(accountUsageVideo) {
-			if app.ensureMediaCookieAccount(ctx, accountUsageVideo) {
-				attempts = min(attempts+1, 20)
+			if attempt+1 < attempts && app.ensureMediaCookieAccount(ctx, accountUsageVideo) {
 				continue
 			}
 			app.logWarn(ctx, "视频生成账号池已无可用 Cookie 账号", "attempt", attempt+1, "error", lastErr)
@@ -7081,14 +7154,6 @@ func (app *App) mediaRetryAttempts(usage string) int {
 	return clampInt(attempts, 1, 20)
 }
 
-func shouldSwitchMediaAccount(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return isUpstreamWAFErrorMessage(msg) || isRateLimitErrorMessage(msg) || isTransientUpstreamErrorMessage(msg)
-}
-
 // acquireMediaSlot 串行化或限流媒体上游请求，避免并发请求集中触发 Qwen 风控。
 func (app *App) acquireMediaSlot(ctx context.Context) (func(), error) {
 	if app == nil || cap(app.mediaSlots) == 0 {
@@ -7109,6 +7174,10 @@ func (app *App) ensureMediaCookieAccount(ctx context.Context, usage string) bool
 	}
 	if app.accounts.HasCookieBackedAvailableFor(usage) {
 		return true
+	}
+	// 已有 Cookie 账号只是处于冷却或占用状态时，等待恢复而不是无界扩容。
+	if app.accounts.HasCookieBackedAccount() {
+		return false
 	}
 	app.mediaRefreshMu.Lock()
 	defer app.mediaRefreshMu.Unlock()
@@ -7194,58 +7263,59 @@ func (app *App) waitMediaPace(ctx context.Context) error {
 	return nil
 }
 
-func (app *App) mediaWAFCircuitError() error {
+func (app *App) mediaCircuitError() error {
 	if app == nil {
 		return nil
 	}
-	app.mediaWAFMu.Lock()
-	defer app.mediaWAFMu.Unlock()
-	if app.mediaWAFUntil.IsZero() || time.Now().After(app.mediaWAFUntil) {
+	app.mediaCircuitMu.Lock()
+	defer app.mediaCircuitMu.Unlock()
+	if app.mediaCircuitUntil.IsZero() || time.Now().After(app.mediaCircuitUntil) {
 		return nil
 	}
-	return app.mediaWAFErrorLocked(nil)
+	return app.mediaCircuitErrorLocked(nil)
 }
 
-func (app *App) tripMediaWAFCircuit(err error) {
-	if app == nil || app.settings.MediaWAFBreakerCooldownSeconds <= 0 {
+func (app *App) tripMediaCircuit(err error, reason string, cooldown int) {
+	if app == nil || cooldown <= 0 {
 		return
 	}
-	app.mediaWAFMu.Lock()
-	defer app.mediaWAFMu.Unlock()
-	app.mediaWAFUntil = time.Now().Add(time.Duration(app.settings.MediaWAFBreakerCooldownSeconds) * time.Second)
+	app.mediaCircuitMu.Lock()
+	defer app.mediaCircuitMu.Unlock()
+	app.mediaCircuitUntil = time.Now().Add(time.Duration(cooldown) * time.Second)
+	app.mediaCircuitReason = reason
 	if err != nil {
-		app.mediaWAFLastError = err.Error()
+		app.mediaCircuitLastError = err.Error()
 	}
 }
 
-func (app *App) mediaWAFError(err error) error {
-	if app == nil {
-		return err
-	}
-	app.mediaWAFMu.Lock()
-	defer app.mediaWAFMu.Unlock()
-	return app.mediaWAFErrorLocked(err)
-}
-
-func (app *App) mediaWAFErrorLocked(err error) error {
+func (app *App) mediaCircuitErrorLocked(err error) error {
 	detail := ""
 	if err != nil {
 		detail = err.Error()
 	}
 	if detail == "" {
-		detail = app.mediaWAFLastError
+		detail = app.mediaCircuitLastError
 	}
-	if app.mediaWAFUntil.After(time.Now()) {
-		return fmt.Errorf("upstream Qwen media request blocked by Aliyun WAF; circuit breaker active until %s. Last error: %s", app.mediaWAFUntil.Format(time.RFC3339), truncate(detail, 240))
+	if app.mediaCircuitUntil.After(time.Now()) {
+		return fmt.Errorf("upstream Qwen media temporarily unavailable; circuit breaker active until %s; reason=%s; last error: %s", app.mediaCircuitUntil.Format(time.RFC3339), app.mediaCircuitReason, truncate(detail, 240))
 	}
-	return fmt.Errorf("upstream Qwen media request blocked by Aliyun WAF: %s", truncate(detail, 240))
+	return fmt.Errorf("upstream Qwen media temporarily unavailable: %s", truncate(detail, 240))
 }
 
 func upstreamMediaErrorStatus(err error) int {
 	if err == nil {
 		return http.StatusInternalServerError
 	}
+	if errors.Is(err, context.Canceled) {
+		return 499
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
 	msg := err.Error()
+	if isUpstreamBusyErrorMessage(msg) || strings.Contains(msg, "reason=upstream_busy") {
+		return http.StatusServiceUnavailable
+	}
 	if isUpstreamWAFErrorMessage(msg) {
 		return http.StatusBadGateway
 	}

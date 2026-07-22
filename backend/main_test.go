@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -142,6 +144,71 @@ func TestCookieRefreshCandidatesReturnValidTokenOnlyAccounts(t *testing.T) {
 	candidates := pool.CookieRefreshCandidates(2)
 	if len(candidates) != 1 || candidates[0].Email != "plain@example.com" {
 		t.Fatalf("expected only valid token-only account candidate, got %#v", candidates)
+	}
+}
+
+func TestUpstreamBusyDoesNotConsumeAccountQuota(t *testing.T) {
+	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	acc := &Account{Email: "busy@example.com", Token: "token", Cookies: "cna=abc", Valid: true, StatusCode: "valid"}
+	pool.accounts = []*Account{acc}
+	app := &App{accounts: pool, settings: Settings{RateLimitBaseCooldown: 600}}
+	err := errors.New("Qwen upstream error code=quota_limit details=目前服务访问量较大，请稍后再试。")
+
+	app.classifyAccountErrorFor(acc, err, accountUsageImage)
+
+	if acc.rateLimitedUntilFor(accountUsageImage) != 0 {
+		t.Fatal("upstream congestion must not consume account image quota")
+	}
+	circuitErr := app.mediaCircuitError()
+	if circuitErr == nil {
+		t.Fatal("upstream congestion should open the media circuit")
+	}
+	if status := upstreamMediaErrorStatus(circuitErr); status != 503 {
+		t.Fatalf("expected active upstream congestion circuit status 503, got %d", status)
+	}
+	if isRateLimitErrorMessage(err.Error()) {
+		t.Fatal("upstream congestion must not be classified as an account rate limit")
+	}
+	if status := upstreamMediaErrorStatus(err); status != 503 {
+		t.Fatalf("expected upstream congestion status 503, got %d", status)
+	}
+}
+
+func TestCookieRefreshDoesNotExpandCooledPool(t *testing.T) {
+	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	acc := &Account{Email: "cooldown@example.com", Token: "token", Cookies: "cna=abc", Valid: true, StatusCode: "valid"}
+	acc.setRateLimitFor(accountUsageImage, float64(time.Now().Add(time.Minute).UnixNano())/1e9, "quota")
+	pool.accounts = []*Account{acc}
+	app := &App{accounts: pool, settings: Settings{MediaCookieRefreshBatch: 5}}
+
+	if app.ensureMediaCookieAccount(context.Background(), accountUsageImage) {
+		t.Fatal("cooled Cookie accounts should recover naturally instead of expanding the pool")
+	}
+}
+
+func TestCanceledMediaRequestUsesClientClosedStatus(t *testing.T) {
+	err := fmt.Errorf("wrapped: %w", context.Canceled)
+	if status := upstreamMediaErrorStatus(err); status != 499 {
+		t.Fatalf("expected canceled request status 499, got %d", status)
+	}
+}
+
+func TestTokenRefreshInitialDelayHonorsCancellation(t *testing.T) {
+	service := &TokenRefreshService{app: &App{settings: Settings{
+		TokenRefreshInitialDelaySeconds: 60,
+		TokenRefreshCheckInterval:       60,
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		service.run(ctx)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("token refresh startup delay should stop after cancellation")
 	}
 }
 
