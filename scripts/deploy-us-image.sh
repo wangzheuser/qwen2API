@@ -8,10 +8,8 @@ SSH_TARGET="${US_SSH_TARGET:-us}"
 SSH_PORT="${US_SSH_PORT:-}"
 REMOTE_DIR="${US_DEPLOY_DIR:-/opt/docker_projects/qwen2api}"
 PUBLIC_HEALTH_URL="${US_PUBLIC_HEALTH_URL:-https://qwen2api.codeai.de5.net/healthz}"
-PROXY_CONFIG="${US_PROXY_CONFIG:-/opt/docker_projects/nginx-proxy/nginx.conf}"
-PROXY_CONTAINER="${US_PROXY_CONTAINER:-nginx-proxy}"
-BLUE_PORT="${US_BLUE_PORT:-17861}"
-GREEN_PORT="${US_GREEN_PORT:-17862}"
+BLUE_PORT="17863"
+GREEN_PORT="17864"
 SSH_ARGS=()
 SCP_ARGS=()
 
@@ -85,22 +83,20 @@ PY
 
 ssh "${SSH_ARGS[@]}" "${SSH_TARGET}" bash -s -- \
   "${IMAGE_TAG}" "${REMOTE_DIR}" "${remote_archive}" "${PUBLIC_HEALTH_URL}" \
-  "${PROXY_CONFIG}" "${PROXY_CONTAINER}" "${BLUE_PORT}" "${GREEN_PORT}" <<'REMOTE'
+  "${BLUE_PORT}" "${GREEN_PORT}" <<'REMOTE'
 set -euo pipefail
 new_tag="$1"
 deploy_dir="$2"
 archive="$3"
 public_health_url="$4"
-proxy_config="$5"
-proxy_container="$6"
-blue_port="$7"
-green_port="$8"
+blue_port="$5"
+green_port="$6"
 state_file="${deploy_dir}/.active-slot"
-proxy_backup="${proxy_config}.qwen2api-deploy-backup"
 router_config="${deploy_dir}/qwen2api-router.conf"
 router_template="${deploy_dir}/qwen2api-router.conf.template"
 router_backup="${router_config}.deploy-backup"
 router_compose="${deploy_dir}/docker-compose.router.yml"
+stable_ports=( 7860 17861 17862 )
 
 cleanup_archive() { rm -f "${archive}"; }
 trap cleanup_archive EXIT
@@ -109,12 +105,11 @@ docker image inspect "qwen2api:${new_tag}" >/dev/null
 cd "${deploy_dir}"
 test -f .env.compose
 
-active_slot="legacy"
-[[ -f "${state_file}" ]] && active_slot="$(cat "${state_file}")"
+[[ -f "${state_file}" ]] || { printf 'Missing active slot state: %s\n' "${state_file}" >&2; exit 1; }
+active_slot="$(cat "${state_file}")"
 case "${active_slot}" in
-  blue) active_port="${blue_port}"; candidate_slot="green"; candidate_port="${green_port}" ;;
-  green) active_port="${green_port}"; candidate_slot="blue"; candidate_port="${blue_port}" ;;
-  legacy) candidate_slot="green"; candidate_port="${green_port}" ;;
+  blue) candidate_slot="green"; candidate_port="${green_port}" ;;
+  green) candidate_slot="blue"; candidate_port="${blue_port}" ;;
   *) printf 'Invalid active slot: %s\n' "${active_slot}" >&2; exit 1 ;;
 esac
 
@@ -151,111 +146,60 @@ output.write_text(template.replace("__QWEN2API_TARGET_PORT__", port))
 PY
 }
 
-# Reuse the service-owned nginx router so internal clients keep port 7860.
+# Reuse the service-owned router for all stable internal and public proxy ports.
 switch_router() {
   render_router_config "${router_config}" "$1"
   docker compose -p qwen2api_router -f "${router_compose}" up -d
   docker exec qwen2api-router nginx -t >/dev/null
   docker exec qwen2api-router nginx -s reload
   for _ in $(seq 1 30); do
-    curl -fsS http://172.17.0.1:7860/healthz >/dev/null && return 0
+    ready=true
+    for stable_port in "${stable_ports[@]}"; do
+      curl -fsS "http://172.17.0.1:${stable_port}/healthz" >/dev/null || ready=false
+    done
+    [[ "${ready}" == "true" ]] && return 0
     sleep 1
   done
   return 1
 }
 
-cp "${proxy_config}" "${proxy_backup}"
 router_switched=false
-legacy_stopped=false
+old_stopped=false
 rollback_routes() {
-  if [[ "${legacy_stopped}" == "true" ]]; then
-    docker stop qwen2api-router >/dev/null 2>&1 || true
-    docker start qwen2api >/dev/null 2>&1 || true
-  elif [[ "${router_switched}" == "true" && -f "${router_backup}" ]]; then
+  set +e
+  if [[ "${old_stopped}" == "true" ]]; then
+    docker start "qwen2api-${active_slot}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${router_switched}" == "true" && -f "${router_backup}" ]]; then
     cp "${router_backup}" "${router_config}"
     docker compose -p qwen2api_router -f "${router_compose}" up -d >/dev/null
     docker exec qwen2api-router nginx -t >/dev/null
     docker exec qwen2api-router nginx -s reload
   fi
-  cp "${proxy_backup}" "${proxy_config}"
-  docker exec "${proxy_container}" nginx -t >/dev/null
-  docker exec "${proxy_container}" nginx -s reload
   docker stop "qwen2api-${candidate_slot}" >/dev/null 2>&1 || true
-  rm -f "${proxy_backup}" "${router_backup}"
+  rm -f "${router_backup}"
 }
 trap 'rollback_routes; cleanup_archive' ERR
+cp "${router_config}" "${router_backup}"
 
-if [[ "${active_slot}" != "legacy" ]]; then
-  if [[ -f "${router_config}" ]]; then
-    cp "${router_config}" "${router_backup}"
-  else
-    render_router_config "${router_backup}" "${active_port}"
-  fi
-  router_switched=true
-  switch_router "${candidate_port}"
-fi
-
-QWEN2API_PROXY_CONFIG="${proxy_config}" QWEN2API_TARGET_PORT="${candidate_port}" python3 - <<'PY'
-import os
-import re
-from pathlib import Path
-
-path = Path(os.environ["QWEN2API_PROXY_CONFIG"])
-port = os.environ["QWEN2API_TARGET_PORT"]
-text = path.read_text()
-marker_at = text.find("server_name qwen2api.codeai.de5.net;")
-if marker_at < 0:
-    raise SystemExit("qwen2api server block not found")
-start = text.rfind("server {", 0, marker_at)
-if start < 0:
-    raise SystemExit("qwen2api server block start not found")
-depth = 0
-end = -1
-for index in range(start, len(text)):
-    if text[index] == "{":
-        depth += 1
-    elif text[index] == "}":
-        depth -= 1
-        if depth == 0:
-            end = index + 1
-            break
-if end < 0:
-    raise SystemExit("qwen2api server block end not found")
-block, count = re.subn(
-    r"proxy_pass http://host\.docker\.internal:\d+;",
-    f"proxy_pass http://host.docker.internal:{port};",
-    text[start:end],
-)
-if count == 0:
-    raise SystemExit("qwen2api proxy_pass not found")
-path.write_text(text[:start] + block + text[end:])
-PY
-
-docker exec "${proxy_container}" nginx -t >/dev/null
-docker exec "${proxy_container}" nginx -s reload
-for _ in $(seq 1 30); do
-  curl -fsS "${public_health_url}" >/dev/null && break
-  sleep 2
-done
+router_switched=true
+switch_router "${candidate_port}"
 curl -fsS "${public_health_url}" >/dev/null
 
-if [[ "${active_slot}" == "legacy" ]]; then
-  docker stop qwen2api >/dev/null
-  legacy_stopped=true
-  router_switched=true
-  switch_router "${candidate_port}"
-fi
+docker stop "qwen2api-${active_slot}" >/dev/null
+old_stopped=true
+[[ "$(docker inspect -f '{{.State.Running}}' "qwen2api-${active_slot}")" == "false" ]]
 
 printf '%s\n' "${candidate_slot}" > "${state_file}"
 printf '%s\n' "${new_tag}" > "${deploy_dir}/.slot-${candidate_slot}-tag"
-case "${active_slot}" in
-  blue|green) docker stop "qwen2api-${active_slot}" >/dev/null ;;
-esac
-rm -f "${proxy_backup}" "${router_backup}"
+rm -f "${router_backup}"
+trap - ERR
 trap cleanup_archive EXIT
 
 docker ps --filter "name=qwen2api-${candidate_slot}" --format '{{.Names}} {{.Image}} {{.Status}}'
 docker ps --filter "name=qwen2api-router" --format '{{.Names}} {{.Image}} {{.Status}}'
-curl -fsS http://172.17.0.1:7860/healthz
+for stable_port in "${stable_ports[@]}"; do
+  curl -fsS "http://172.17.0.1:${stable_port}/healthz"
+done
 curl -fsS "${public_health_url}"
 REMOTE
