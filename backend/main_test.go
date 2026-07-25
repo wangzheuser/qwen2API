@@ -444,6 +444,22 @@ func TestUpstreamThinkingEnabledForVision(t *testing.T) {
 	}
 }
 
+// TestNormalizeResponsesToolAcceptsTopLevelFunctionFields covers the official Responses tool shape.
+func TestNormalizeResponsesToolAcceptsTopLevelFunctionFields(t *testing.T) {
+	tool := normalizeResponsesTool(map[string]any{
+		"type":       "function",
+		"name":       "get_weather",
+		"parameters": map[string]any{"type": "object"},
+	})
+	if tool == nil {
+		t.Fatal("top-level Responses function tool was dropped")
+	}
+	function, _ := tool["function"].(map[string]any)
+	if function["name"] != "get_weather" {
+		t.Fatalf("unexpected normalized function: %#v", function)
+	}
+}
+
 func contextBackgroundForTest() context.Context {
 	return context.Background()
 }

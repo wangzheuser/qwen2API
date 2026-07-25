@@ -17,7 +17,7 @@ type ToolSieve struct {
 	tools       []map[string]any
 	toolNames   map[string]bool
 	pending     string
-	capture     string
+	capture     strings.Builder
 	capturing   bool
 	inFence     bool
 	fenceChar   byte
@@ -41,7 +41,7 @@ func (s *ToolSieve) ProcessChunk(chunk string) []SieveEvent {
 	s.pending += chunk
 	events := []SieveEvent{}
 	if s.capturing {
-		s.capture += s.pending
+		s.capture.WriteString(s.pending)
 		s.pending = ""
 		prefix, calls, suffix, ready := s.consumeToolCapture(false)
 		if ready && len(calls) > 0 {
@@ -50,7 +50,7 @@ func (s *ToolSieve) ProcessChunk(chunk string) []SieveEvent {
 			}
 			events = append(events, SieveEvent{Type: "tool_calls", Calls: calls})
 			s.pending = suffix
-			s.capture = ""
+			s.capture.Reset()
 			s.capturing = false
 		}
 		return events
@@ -62,7 +62,7 @@ func (s *ToolSieve) ProcessChunk(chunk string) []SieveEvent {
 			events = append(events, SieveEvent{Type: "content", Text: prefix})
 			s.advanceMarkdownFence(prefix)
 		}
-		s.capture = s.pending[start:]
+		s.capture.WriteString(s.pending[start:])
 		s.pending = ""
 		s.capturing = true
 		prefix, calls, suffix, ready := s.consumeToolCapture(false)
@@ -72,7 +72,7 @@ func (s *ToolSieve) ProcessChunk(chunk string) []SieveEvent {
 			}
 			events = append(events, SieveEvent{Type: "tool_calls", Calls: calls})
 			s.pending = suffix
-			s.capture = ""
+			s.capture.Reset()
 			s.capturing = false
 		}
 		return events
@@ -91,7 +91,7 @@ func (s *ToolSieve) Flush() []SieveEvent {
 		return nil
 	}
 	events := []SieveEvent{}
-	if s.capturing && s.capture != "" {
+	if s.capturing && s.capture.Len() > 0 {
 		prefix, calls, suffix, ready := s.consumeToolCapture(true)
 		if ready && len(calls) > 0 {
 			if prefix != "" {
@@ -102,7 +102,7 @@ func (s *ToolSieve) Flush() []SieveEvent {
 				events = append(events, SieveEvent{Type: "content", Text: suffix})
 			}
 		}
-		s.capture = ""
+		s.capture.Reset()
 		s.capturing = false
 	}
 	if s.pending != "" {
@@ -114,22 +114,26 @@ func (s *ToolSieve) Flush() []SieveEvent {
 }
 
 func (s *ToolSieve) consumeToolCapture(force bool) (string, []ParsedToolCall, string, bool) {
-	if s.capture == "" {
+	if s.capture.Len() == 0 {
 		return "", nil, "", false
 	}
-	if !force && hasStreamingToolEnvelopeStart(s.capture) && !looksStructurallyClosed(s.capture) {
+	capture := s.capture.String()
+	if !force && hasStreamingToolEnvelopeStart(capture) && !looksStructurallyClosed(capture) {
 		return "", nil, "", false
 	}
-	if !force && functionNameRe.MatchString(s.capture) && functionArgumentsRe.MatchString(s.capture) && !looksStructurallyClosed(s.capture) {
+	if !force && looksLikeJSONToolCapture(capture) && !looksStructurallyClosed(capture) {
 		return "", nil, "", false
 	}
-	calls := ParseToolCalls(s.capture, s.tools)
+	if !force && functionNameRe.MatchString(capture) && functionArgumentsRe.MatchString(capture) && !looksStructurallyClosed(capture) {
+		return "", nil, "", false
+	}
+	calls := ParseToolCalls(capture, s.tools)
 	if len(calls) == 0 {
 		return "", nil, "", false
 	}
 	prefix := ""
-	if first := firstToolMarkerIndex(s.capture); first > 0 {
-		prefix = strings.TrimSpace(s.capture[:first])
+	if first := firstToolMarkerIndex(capture); first > 0 {
+		prefix = strings.TrimSpace(capture[:first])
 	}
 	return prefix, calls, "", true
 }
@@ -316,7 +320,18 @@ func firstToolMarkerIndex(text string) int {
 }
 
 func looksStructurallyClosed(text string) bool {
-	return structuralCloseRe.MatchString(text) || strings.Contains(strings.ToLower(text), "</|qnml|tool_calls>") || strings.Contains(strings.ToLower(text), "</tool_calls>")
+	trimmed := strings.TrimSpace(text)
+	return strings.HasSuffix(trimmed, "}") ||
+		strings.HasSuffix(trimmed, "]") ||
+		structuralCloseRe.MatchString(text) ||
+		strings.Contains(strings.ToLower(text), "</|qnml|tool_calls>") ||
+		strings.Contains(strings.ToLower(text), "</tool_calls>")
+}
+
+// looksLikeJSONToolCapture identifies streamed JSON tool-call envelopes.
+func looksLikeJSONToolCapture(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")
 }
 
 func hasStreamingToolEnvelopeStart(text string) bool {

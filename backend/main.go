@@ -5949,7 +5949,10 @@ func normalizeResponsesTool(tool map[string]any) map[string]any {
 	}
 	if toolType == "function" {
 		fn, _ := tool["function"].(map[string]any)
-		if fn == nil || stringValue(fn, "name", "") == "" {
+		if fn == nil {
+			fn = tool
+		}
+		if stringValue(fn, "name", "") == "" {
 			return nil
 		}
 		params := firstNonNil(fn["parameters"], fn["input_schema"], tool["parameters"], map[string]any{})
