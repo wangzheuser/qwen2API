@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,6 +64,34 @@ func TestShouldForceToolContinuationStillRejectsGenericNarration(t *testing.T) {
 
 	if !shouldForceToolContinuation(req, result) {
 		t.Fatal("generic narration after a tool result should still trigger continuation recovery")
+	}
+}
+
+// TestShouldForceToolContinuationAllowsConciseFinalAfterSilentVerification covers quiet checks such as diff.
+func TestShouldForceToolContinuationAllowsConciseFinalAfterSilentVerification(t *testing.T) {
+	req := StandardRequest{
+		Prompt: stringsJoinForTest(
+			"Human: verify the files with diff, then answer exactly CODEX-LOCAL-OK",
+			"",
+			"Assistant: <|QNML|tool_calls><|QNML|invoke name=\"exec_command\"><|QNML|parameter name=\"cmd\"><![CDATA[diff input.txt output.txt]]></|QNML|parameter></|QNML|invoke></|QNML|tool_calls>",
+			"",
+			"[Tool Result id=call_123]",
+			"",
+			"[/Tool Result]",
+			"",
+			"[STATE NOTICE: MUST OBEY]",
+			"The latest client message is a tool result, not a new user request.",
+			"Assistant:",
+		),
+		Tools:                     []map[string]any{{"name": "exec_command"}},
+		ToolNames:                 []string{"exec_command"},
+		ToolEnabled:               true,
+		LatestMessageIsToolResult: true,
+	}
+	result := CompletionResult{AnswerText: "CODEX-LOCAL-OK"}
+
+	if shouldForceToolContinuation(req, result) {
+		t.Fatal("concise final text after a successful silent verification should be accepted")
 	}
 }
 
@@ -458,6 +488,134 @@ func TestNormalizeResponsesToolAcceptsTopLevelFunctionFields(t *testing.T) {
 	if function["name"] != "get_weather" {
 		t.Fatalf("unexpected normalized function: %#v", function)
 	}
+}
+
+// TestResponsesPreviousResponseRestoresToolHistory verifies stateful tool-result follow-ups.
+func TestResponsesPreviousResponseRestoresToolHistory(t *testing.T) {
+	app := &App{responses: map[string]storedResponseState{}}
+	call := map[string]any{
+		"id": "fc_test", "type": "function_call", "status": "completed", "call_id": "call_test",
+		"name": "lookup_marker", "arguments": `{"key":"alpha"}`,
+	}
+	app.rememberResponse("resp_test", "owner-token", []any{"find alpha"}, []map[string]any{call})
+
+	expanded, items := app.expandResponsesBody(map[string]any{
+		"previous_response_id": "resp_test",
+		"input":                []any{map[string]any{"type": "function_call_output", "call_id": "call_test", "output": "MARKER-7319"}},
+	}, "owner-token")
+	if len(items) != 3 {
+		t.Fatalf("expected restored input, call and output, got %#v", items)
+	}
+	messages := anyList(responsesToChatBody(expanded)["messages"])
+	if len(messages) != 3 {
+		t.Fatalf("expected three converted messages, got %#v", messages)
+	}
+	roles := []string{}
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		roles = append(roles, stringValue(message, "role", ""))
+	}
+	if strings.Join(roles, ",") != "user,assistant,tool" {
+		t.Fatalf("unexpected restored role sequence: %#v", roles)
+	}
+}
+
+// TestResponsesPreviousResponseIsTokenScoped prevents conversation disclosure across API keys.
+func TestResponsesPreviousResponseIsTokenScoped(t *testing.T) {
+	app := &App{responses: map[string]storedResponseState{}}
+	app.rememberResponse("resp_private", "owner-token", []any{"private"}, nil)
+
+	_, items := app.expandResponsesBody(map[string]any{
+		"previous_response_id": "resp_private",
+		"input":                "public",
+	}, "other-token")
+	if len(items) != 1 || items[0] != "public" {
+		t.Fatalf("foreign response history leaked: %#v", items)
+	}
+}
+
+// TestResponsesTextStreamEmitsLifecycleBeforeDelta covers the Codex SSE state machine contract.
+func TestResponsesTextStreamEmitsLifecycleBeforeDelta(t *testing.T) {
+	var output bytes.Buffer
+	started := 0
+	stream := newResponsesTextStream(&output, func() { started++ })
+	stream.WriteDelta("LOCAL-")
+	stream.WriteDelta("OK")
+	item := stream.Finish("LOCAL-OK")
+
+	events := responseEventNamesForTest(output.String())
+	want := []string{
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+	}
+	if started != 1 || strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("unexpected lifecycle: started=%d events=%#v", started, events)
+	}
+	if item["status"] != "completed" || item["id"] == "" {
+		t.Fatalf("unexpected completed item: %#v", item)
+	}
+	for _, block := range strings.Split(strings.TrimSpace(output.String()), "\n\n") {
+		if strings.Contains(block, "response.output_text.delta") && !strings.Contains(block, `"item_id":"msg_`) {
+			t.Fatalf("delta is missing its active item id: %s", block)
+		}
+	}
+}
+
+// TestResponsesToolStreamEmitsAddedBeforeDone covers function-call item ordering.
+func TestResponsesToolStreamEmitsAddedBeforeDone(t *testing.T) {
+	var output bytes.Buffer
+	writeResponsesToolItemEvents(&output, map[string]any{
+		"id": "fc_test", "type": "function_call", "status": "completed", "call_id": "call_test",
+		"name": "lookup_marker", "arguments": `{"key":"alpha"}`,
+	}, 0)
+	events := responseEventNamesForTest(output.String())
+	want := "response.output_item.added,response.function_call_arguments.delta,response.function_call_arguments.done,response.output_item.done"
+	if strings.Join(events, ",") != want {
+		t.Fatalf("unexpected tool lifecycle: %#v", events)
+	}
+}
+
+// TestFilterRepeatedToolCallBlocksSuccessfulPostResultReplay covers one-call tool loops.
+func TestFilterRepeatedToolCallBlocksSuccessfulPostResultReplay(t *testing.T) {
+	call := ParsedToolCall{Name: "lookup_marker", Input: map[string]any{"key": "alpha"}}
+	req := StandardRequest{
+		Prompt:                    "[Tool Result id=call_test]\nSTATEFUL-OK\n[/Tool Result]",
+		LatestMessageIsToolResult: true,
+		RepeatedToolCount:         1,
+		RepeatedToolSignature:     parsedToolCallSignature(call),
+	}
+	kept, blocked := filterRepeatedToolCalls(req, []ParsedToolCall{call})
+	if len(kept) != 0 || len(blocked) != 1 {
+		t.Fatalf("successful tool result replay was not blocked: kept=%#v blocked=%#v", kept, blocked)
+	}
+
+	req.Prompt = "[Tool Result id=call_test]\ntimeout; retry\n[/Tool Result]"
+	kept, blocked = filterRepeatedToolCalls(req, []ParsedToolCall{call})
+	if len(kept) != 1 || len(blocked) != 0 {
+		t.Fatalf("explicit retryable failure was blocked: kept=%#v blocked=%#v", kept, blocked)
+	}
+
+	req.Prompt = "[Tool Result id=call_test]\n{\"session_id\":42,\"status\":\"process running\"}\n[/Tool Result]"
+	kept, blocked = filterRepeatedToolCalls(req, []ParsedToolCall{call})
+	if len(kept) != 1 || len(blocked) != 0 {
+		t.Fatalf("long-running tool polling was blocked: kept=%#v blocked=%#v", kept, blocked)
+	}
+}
+
+// responseEventNamesForTest extracts event names from an SSE transcript.
+func responseEventNamesForTest(raw string) []string {
+	events := []string{}
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(line, "event: ") {
+			events = append(events, strings.TrimPrefix(line, "event: "))
+		}
+	}
+	return events
 }
 
 func contextBackgroundForTest() context.Context {

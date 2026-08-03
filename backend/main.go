@@ -76,6 +76,8 @@ type App struct {
 	mediaCircuitUntil     time.Time
 	mediaCircuitLastError string
 	mediaCircuitReason    string
+	responsesMu           sync.Mutex
+	responses             map[string]storedResponseState
 }
 
 func main() {
@@ -173,6 +175,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 		fileContentCache:  newFileContentCache(),
 		videoTasks:        map[string]*VideoTask{},
 		mediaSlots:        make(chan struct{}, maxInt(settings.MediaMaxConcurrency, 1)),
+		responses:         map[string]storedResponseState{},
 	}
 
 	app.apiKeys, app.managedAPIKeys, app.envAPIKeys = loadAPIKeys(settings.APIKeysFile, logger)
@@ -4138,7 +4141,11 @@ func argValuePresent(value any) bool {
 }
 
 func filterRepeatedToolCalls(req StandardRequest, calls []ParsedToolCall) ([]ParsedToolCall, []ParsedToolCall) {
-	if len(calls) == 0 || req.RepeatedToolCount < 3 || strings.TrimSpace(req.RepeatedToolSignature) == "" {
+	minimumCount := 3
+	if req.LatestMessageIsToolResult && !latestToolResultAllowsSameCall(req.Prompt) {
+		minimumCount = 1
+	}
+	if len(calls) == 0 || req.RepeatedToolCount < minimumCount || strings.TrimSpace(req.RepeatedToolSignature) == "" {
 		return calls, nil
 	}
 	kept := make([]ParsedToolCall, 0, len(calls))
@@ -4151,6 +4158,25 @@ func filterRepeatedToolCalls(req StandardRequest, calls []ParsedToolCall) ([]Par
 		kept = append(kept, call)
 	}
 	return kept, blocked
+}
+
+// latestToolResultAllowsSameCall preserves explicit retries and long-running tool polling.
+func latestToolResultAllowsSameCall(prompt string) bool {
+	result := strings.ToLower(latestToolResultText(prompt))
+	if result == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"error", "failed", "failure", "timeout", "timed out", "retry", "try again", "not found", "unavailable",
+		"script running", "process running", "still running", "session_id", "cell id", "in_progress",
+		"错误", "失败", "超时", "重试", "再试", "未找到", "不可用",
+		"仍在运行", "正在运行",
+	} {
+		if strings.Contains(result, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldBufferStreamTextDeltas(req StandardRequest) bool {
@@ -5649,7 +5675,8 @@ func (app *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
-	converted := responsesToChatBody(body)
+	expandedBody, responseItems := app.expandResponsesBody(body, auth.Token)
+	converted := responsesToChatBody(expandedBody)
 	req, err := app.prepareStandardRequest(r.Context(), r, converted, "gpt-3.5-turbo", "responses", auth.Token)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -5658,7 +5685,7 @@ func (app *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	app.recordStandardRequest(r.Context(), req)
 	id := "resp_" + randomID()[:24]
 	if req.Stream {
-		app.streamResponses(w, r, req, id)
+		app.streamResponses(w, r, req, id, responseItems, auth.Token, responsesStoreEnabled(body))
 		return
 	}
 	result, err := app.runCompletion(r.Context(), req, "")
@@ -5683,6 +5710,9 @@ func (app *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 			"id": "msg_" + randomID()[:12], "type": "message", "status": "completed", "role": "assistant",
 			"content": content,
 		})
+	}
+	if responsesStoreEnabled(body) {
+		app.rememberResponse(id, auth.Token, responseItems, output)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": id, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": req.ResponseModel,
@@ -6008,7 +6038,7 @@ func firstNonNil(values ...any) any {
 	return nil
 }
 
-func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req StandardRequest, id string) {
+func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req StandardRequest, id string, responseItems []any, authToken string, store bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -6021,6 +6051,7 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 		flushSSE(w)
 		streamStarted = true
 	}
+	textStream := newResponsesTextStream(w, startStream)
 
 	toolCallsSent := false
 	hooks := &completionStreamHooks{
@@ -6028,8 +6059,7 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 			if delta == "" || toolCallsSent {
 				return nil
 			}
-			startStream()
-			writeSSEEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "delta": delta})
+			textStream.WriteDelta(delta)
 			flushSSE(w)
 			return nil
 		},
@@ -6041,8 +6071,11 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 			app.logParsedToolCalls(r.Context(), "ToolCall", "responses_stream_response", calls)
 			app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 			output := responsesToolItems(calls)
-			for _, item := range output {
-				writeSSEEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "item": item})
+			for index, item := range output {
+				writeResponsesToolItemEvents(w, item, index)
+			}
+			if store {
+				app.rememberResponse(id, authToken, responseItems, output)
 			}
 			writeSSEEvent(w, "response.completed", map[string]any{
 				"type":     "response.completed",
@@ -6075,18 +6108,18 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 		app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", len(calls), "raw_tool_blocks", len(calls), "stop_reason", "tool_calls", "has_tool_use", true)
 		output = responsesToolItems(calls)
 		outputText = ""
-		for _, item := range output {
-			writeSSEEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "item": item})
+		for index, item := range output {
+			writeResponsesToolItemEvents(w, item, index)
 		}
 	} else {
 		app.logInfo(r.Context(), "[ToolDirective]", "tool_blocks", 1, "raw_tool_blocks", 1, "stop_reason", "completed", "has_tool_use", false)
 		if outputText == "" && result.ReasoningText == "" {
 			outputText = emptyCompletionFallback(req, result)
 		}
-		output = append(output, map[string]any{"type": "message", "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": outputText}}})
-		if req.ToolEnabled || result.AnswerText == "" {
-			writeSSEEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "delta": outputText})
-		}
+		output = append(output, textStream.Finish(outputText))
+	}
+	if store {
+		app.rememberResponse(id, authToken, responseItems, output)
 	}
 	writeSSEEvent(w, "response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": id, "status": "completed", "output": output, "output_text": outputText}})
 	flushSSE(w)
@@ -9151,7 +9184,6 @@ func isLikelyNarrationOnlyToolTurn(text string) bool {
 	if trimmed == "" {
 		return true
 	}
-	runes := len([]rune(trimmed))
 	lines := strings.Split(trimmed, "\n")
 	nonEmpty := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -9164,10 +9196,7 @@ func isLikelyNarrationOnlyToolTurn(text string) bool {
 		return true
 	}
 	first := nonEmpty[0]
-	if missingToolContinuationLeadRe.MatchString(first) && runes <= 1500 && len(nonEmpty) <= 20 {
-		return true
-	}
-	return runes <= 220 && len(nonEmpty) <= 4
+	return missingToolContinuationLeadRe.MatchString(first) && len([]rune(trimmed)) <= 1500 && len(nonEmpty) <= 20
 }
 
 func isInitialNarrationOnlyToolTurn(text string) bool {

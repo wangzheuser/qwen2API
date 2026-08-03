@@ -521,7 +521,7 @@ def run_one_scenario(
         command = build_claude_command(args, model.model_id, scenario, case_dir, prompt)
         command_result = run_claude_command(
             command=command,
-            env=build_claude_env(args, env_api_key),
+            env=build_claude_env(args, env_api_key, case_dir / ".claude-config"),
             cwd=case_dir,
             timeout_seconds=scenario.timeout_seconds or args.timeout,
         )
@@ -632,11 +632,14 @@ def build_claude_command(
     return command
 
 
-def build_claude_env(args: argparse.Namespace, api_key: str) -> dict[str, str]:
-    """构造 Claude Code 子进程环境变量，避免 API Key 进入命令行。"""
+def build_claude_env(args: argparse.Namespace, api_key: str, config_dir: pathlib.Path) -> dict[str, str]:
+    """隔离 Claude Code 配置并通过环境变量传递 API 地址与密钥。"""
     env = os.environ.copy()
     anthropic_base = args.anthropic_base_url.strip() or args.api_base.rstrip("/") + "/anthropic"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     env["ANTHROPIC_BASE_URL"] = anthropic_base
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
     env["ANTHROPIC_API_KEY"] = api_key
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
@@ -1302,7 +1305,7 @@ def discover_available_tools(args: argparse.Namespace, result_root: pathlib.Path
         "Initialize only. Do not call tools.",
     ])
 
-    env = build_claude_env(args, "sk-invalid-tool-discovery")
+    env = build_claude_env(args, "sk-invalid-tool-discovery", case_dir / ".claude-config")
     result = run_claude_command(command=command, env=env, cwd=case_dir, timeout_seconds=30)
     (case_dir / "claude.stdout.jsonl").write_text(result.stdout, encoding="utf-8")
     (case_dir / "claude.stderr.log").write_text(result.stderr, encoding="utf-8")

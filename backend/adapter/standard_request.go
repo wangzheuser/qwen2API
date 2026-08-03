@@ -754,7 +754,7 @@ func latestRepeatedToolCall(messages []any, limit int) (string, int) {
 
 func latestRepeatedToolCallActivity(messages []any, limit int) (toolCallActivity, int) {
 	calls := collectRecentToolCalls(messages, limit)
-	if len(calls) < 2 {
+	if len(calls) == 0 {
 		return toolCallActivity{}, 0
 	}
 	latest := calls[len(calls)-1]
@@ -768,9 +768,6 @@ func latestRepeatedToolCallActivity(messages []any, limit int) (toolCallActivity
 			break
 		}
 		count++
-	}
-	if count < 2 {
-		return toolCallActivity{}, 0
 	}
 	return latest, count
 }
