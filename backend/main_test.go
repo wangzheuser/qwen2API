@@ -474,6 +474,64 @@ func TestUpstreamThinkingEnabledForVision(t *testing.T) {
 	}
 }
 
+// TestCompactPayloadDropsOldestTurns verifies that the shared prompt budget preserves the newest turn.
+func TestCompactPayloadDropsOldestTurns(t *testing.T) {
+	payload := map[string]any{
+		"model": "qwen3.8-max",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "SYSTEM-MARKER"},
+			map[string]any{"role": "user", "content": "OLDEST-MARKER\n" + strings.Repeat("a", 5000)},
+			map[string]any{"role": "assistant", "content": strings.Repeat("b", 5000)},
+			map[string]any{"role": "user", "content": "LATEST-MARKER\n" + strings.Repeat("c", 3000)},
+		},
+	}
+
+	compacted, stats := compactPayloadToPromptBudget(payload, "qwen3.8-max", "chat", 5000)
+	prompt := buildChatStandardRequest(compacted, "qwen3.8-max", "chat").Prompt
+	if !stats.Compacted || stats.DroppedTurns != 1 || len(prompt) > 5000 {
+		t.Fatalf("unexpected compaction stats=%#v prompt_bytes=%d", stats, len(prompt))
+	}
+	if strings.Contains(prompt, "OLDEST-MARKER") || !strings.Contains(prompt, "LATEST-MARKER") || !strings.Contains(prompt, "SYSTEM-MARKER") {
+		t.Fatalf("wrong turns retained after compaction: %q", prompt)
+	}
+}
+
+// TestCompactPayloadTruncatesOversizedLatestMessage covers a single over-window request.
+func TestCompactPayloadTruncatesOversizedLatestMessage(t *testing.T) {
+	payload := map[string]any{
+		"model": "qwen3.8-max",
+		"messages": []any{map[string]any{
+			"role": "user", "content": "HEAD-MARKER\n" + strings.Repeat("中", 6000) + "\nTAIL-MARKER",
+		}},
+	}
+
+	compacted, stats := compactPayloadToPromptBudget(payload, "qwen3.8-max", "chat", 5000)
+	prompt := buildChatStandardRequest(compacted, "qwen3.8-max", "chat").Prompt
+	if !stats.LatestMessageTruncated || len(prompt) > 5000 {
+		t.Fatalf("latest message was not bounded: stats=%#v prompt_bytes=%d", stats, len(prompt))
+	}
+	for _, marker := range []string{"HEAD-MARKER", "TAIL-MARKER", "older context omitted"} {
+		if !strings.Contains(prompt, marker) {
+			t.Fatalf("missing %q after truncation", marker)
+		}
+	}
+}
+
+// TestCompactResponseStateDropsOldestTurns keeps previous_response_id state reusable under its cap.
+func TestCompactResponseStateDropsOldestTurns(t *testing.T) {
+	items := []any{
+		map[string]any{"type": "message", "role": "user", "content": "OLDEST-STATE\n" + strings.Repeat("a", 700)},
+		map[string]any{"type": "message", "role": "assistant", "content": strings.Repeat("b", 300)},
+		map[string]any{"type": "message", "role": "user", "content": "NEWEST-STATE\n" + strings.Repeat("c", 300)},
+	}
+
+	compacted := compactResponseStateItems(items, 600)
+	raw := mustJSON(compacted)
+	if len(raw) > 600 || strings.Contains(raw, "OLDEST-STATE") || !strings.Contains(raw, "NEWEST-STATE") {
+		t.Fatalf("unexpected compacted response state: %s", raw)
+	}
+}
+
 // TestNormalizeResponsesToolAcceptsTopLevelFunctionFields covers the official Responses tool shape.
 func TestNormalizeResponsesToolAcceptsTopLevelFunctionFields(t *testing.T) {
 	tool := normalizeResponsesTool(map[string]any{

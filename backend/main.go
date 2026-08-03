@@ -2078,6 +2078,7 @@ type Settings struct {
 	APIKeysFile                      string
 	ContextInlineMaxChars            int
 	ContextForceFileMaxChars         int
+	ContextWindowMaxBytes            int
 	ContextAttachmentTTLSeconds      int
 	ContextUploadParseTimeoutSeconds int
 	ContextGeneratedDir              string
@@ -2152,6 +2153,7 @@ func LoadSettings() Settings {
 		APIKeysFile:                            filepath.Join(data, "api_keys.json"),
 		ContextInlineMaxChars:                  envInt("CONTEXT_INLINE_MAX_CHARS", 4000),
 		ContextForceFileMaxChars:               envInt("CONTEXT_FORCE_FILE_MAX_CHARS", 10000),
+		ContextWindowMaxBytes:                  maxInt(envInt("CONTEXT_WINDOW_MAX_BYTES", 100000), 16000),
 		ContextAttachmentTTLSeconds:            envInt("CONTEXT_ATTACHMENT_TTL_SECONDS", 1800),
 		ContextUploadParseTimeoutSeconds:       envInt("CONTEXT_UPLOAD_PARSE_TIMEOUT_SECONDS", 60),
 		ContextGeneratedDir:                    envString("CONTEXT_GENERATED_DIR", filepath.Join(data, "context_files")),

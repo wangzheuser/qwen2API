@@ -45,6 +45,7 @@ func (app *App) rememberResponse(id, authToken string, inputItems []any, output 
 	for _, item := range output {
 		items = append(items, item)
 	}
+	items = compactResponseStateItems(items, responseStateMaxBytes)
 	raw, err := json.Marshal(items)
 	if err != nil || len(raw) > responseStateMaxBytes {
 		return
@@ -72,6 +73,38 @@ func (app *App) rememberResponse(id, authToken string, inputItems []any, output 
 		delete(app.responses, oldestID)
 	}
 	app.responses[id] = storedResponseState{AuthToken: authToken, Items: items, CreatedAt: now}
+}
+
+// compactResponseStateItems discards the oldest complete turns before persisting Responses state.
+func compactResponseStateItems(items []any, maxBytes int) []any {
+	compacted := append([]any(nil), items...)
+	for len(compacted) > 1 {
+		raw, err := json.Marshal(compacted)
+		if err != nil || len(raw) <= maxBytes {
+			return compacted
+		}
+		nextUser := -1
+		for idx := 1; idx < len(compacted); idx++ {
+			if responseItemRole(compacted[idx]) == "user" {
+				nextUser = idx
+				break
+			}
+		}
+		if nextUser < 0 {
+			break
+		}
+		compacted = append([]any(nil), compacted[nextUser:]...)
+	}
+	return compacted
+}
+
+// responseItemRole returns the conversational role used as a turn boundary.
+func responseItemRole(item any) string {
+	if _, ok := item.(string); ok {
+		return "user"
+	}
+	value, _ := item.(map[string]any)
+	return stringValue(value, "role", "")
 }
 
 // responseInputItems normalizes a Responses input value into reusable input items.

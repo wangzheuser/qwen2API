@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
@@ -92,6 +93,16 @@ type ContextOffloadPlan struct {
 	SummaryText        string
 	EstimatedPromptLen int
 	Note               string
+}
+
+type contextCompactionStats struct {
+	Compacted              bool
+	OriginalMessages       int
+	RetainedMessages       int
+	DroppedTurns           int
+	OriginalPromptBytes    int
+	FinalPromptBytes       int
+	LatestMessageTruncated bool
 }
 
 type UpstreamFileCacheEntry struct {
@@ -906,6 +917,209 @@ func planContextOffload(settings Settings, messages []any, tools []map[string]an
 	}
 }
 
+// compactPayloadToPromptBudget keeps the newest complete turns within the upstream prompt budget.
+func compactPayloadToPromptBudget(body map[string]any, defaultModel, surface string, maxBytes int) (map[string]any, contextCompactionStats) {
+	compacted := deepCopyMap(body)
+	messages := anyList(compacted["messages"])
+	stats := contextCompactionStats{OriginalMessages: len(messages), RetainedMessages: len(messages)}
+	stats.OriginalPromptBytes = len(buildChatStandardRequest(compacted, defaultModel, surface).Prompt)
+	stats.FinalPromptBytes = stats.OriginalPromptBytes
+	if maxBytes <= 0 || stats.FinalPromptBytes <= maxBytes {
+		return compacted, stats
+	}
+
+	for stats.FinalPromptBytes > maxBytes {
+		var changed bool
+		if messages, changed = dropOldestCompleteTurn(messages); changed {
+			stats.DroppedTurns++
+		} else {
+			overflow := stats.FinalPromptBytes - maxBytes + 1024
+			if messages, changed = truncateLatestUserText(messages, overflow); changed {
+				stats.LatestMessageTruncated = true
+			} else if messages, changed = truncateLargestPinnedText(messages, overflow); !changed {
+				break
+			}
+		}
+		compacted["messages"] = messages
+		stats.FinalPromptBytes = len(buildChatStandardRequest(compacted, defaultModel, surface).Prompt)
+	}
+	stats.Compacted = stats.DroppedTurns > 0 || stats.LatestMessageTruncated || stats.FinalPromptBytes < stats.OriginalPromptBytes
+	stats.RetainedMessages = len(messages)
+	return compacted, stats
+}
+
+// dropOldestCompleteTurn removes one old user turn while preserving pinned instructions and the newest turn.
+func dropOldestCompleteTurn(messages []any) ([]any, bool) {
+	latestUser := -1
+	for idx, raw := range messages {
+		if messageRole(raw) == "user" {
+			latestUser = idx
+		}
+	}
+	if latestUser <= 0 {
+		return messages, false
+	}
+
+	start := -1
+	for idx := 0; idx < latestUser; idx++ {
+		role := messageRole(messages[idx])
+		if role != "system" && role != "developer" {
+			start = idx
+			break
+		}
+	}
+	if start < 0 {
+		return messages, false
+	}
+	end := latestUser
+	for idx := start + 1; idx < latestUser; idx++ {
+		if messageRole(messages[idx]) == "user" {
+			end = idx
+			break
+		}
+	}
+
+	out := append([]any(nil), messages[:start]...)
+	for _, raw := range messages[start:end] {
+		role := messageRole(raw)
+		if role == "system" || role == "developer" {
+			out = append(out, raw)
+		}
+	}
+	out = append(out, messages[end:]...)
+	return out, len(out) < len(messages)
+}
+
+// truncateLatestUserText preserves the head and tail of an oversized current user message.
+func truncateLatestUserText(messages []any, removeBytes int) ([]any, bool) {
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		if messageRole(messages[idx]) != "user" {
+			continue
+		}
+		return truncateMessageText(messages, idx, removeBytes)
+	}
+	return messages, false
+}
+
+// truncateLargestPinnedText is the final guard for an oversized system or developer message.
+func truncateLargestPinnedText(messages []any, removeBytes int) ([]any, bool) {
+	bestIndex := -1
+	bestSize := 0
+	for idx, raw := range messages {
+		role := messageRole(raw)
+		if role != "system" && role != "developer" {
+			continue
+		}
+		msg, _ := raw.(map[string]any)
+		if size := len(flattenContentText(msg["content"])); size > bestSize {
+			bestIndex = idx
+			bestSize = size
+		}
+	}
+	if bestIndex < 0 {
+		return messages, false
+	}
+	return truncateMessageText(messages, bestIndex, removeBytes)
+}
+
+// truncateMessageText shortens one textual message without changing images, files, or tool results.
+func truncateMessageText(messages []any, index, removeBytes int) ([]any, bool) {
+	if index < 0 || index >= len(messages) {
+		return messages, false
+	}
+	msg, ok := messages[index].(map[string]any)
+	if !ok {
+		return messages, false
+	}
+	content, changed := truncateContentText(msg["content"], removeBytes)
+	if !changed {
+		return messages, false
+	}
+	out := append([]any(nil), messages...)
+	clone := copyMap(msg)
+	clone["content"] = content
+	out[index] = clone
+	return out, true
+}
+
+func truncateContentText(content any, removeBytes int) (any, bool) {
+	switch value := content.(type) {
+	case string:
+		target := maxInt(len(value)-maxInt(removeBytes, 1), 256)
+		truncated := truncateUTF8HeadTail(value, target)
+		return truncated, truncated != value
+	case []any:
+		bestIndex := -1
+		bestSize := 0
+		for idx, raw := range value {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			typeName := stringValue(part, "type", "")
+			if typeName != "text" && typeName != "input_text" && typeName != "output_text" {
+				continue
+			}
+			if size := len(stringValue(part, "text", "")); size > bestSize {
+				bestIndex = idx
+				bestSize = size
+			}
+		}
+		if bestIndex < 0 {
+			return content, false
+		}
+		out := append([]any(nil), value...)
+		part := copyMap(value[bestIndex].(map[string]any))
+		target := maxInt(bestSize-maxInt(removeBytes, 1), 256)
+		original := stringValue(part, "text", "")
+		truncated := truncateUTF8HeadTail(original, target)
+		if truncated == original {
+			return content, false
+		}
+		part["text"] = truncated
+		out[bestIndex] = part
+		return out, true
+	default:
+		return content, false
+	}
+}
+
+// truncateUTF8HeadTail keeps instruction framing and the newest question without splitting UTF-8.
+func truncateUTF8HeadTail(text string, maxBytes int) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	const notice = "\n...[older context omitted to fit the upstream window]...\n"
+	if maxBytes <= len(notice)+16 {
+		return utf8Prefix(text, maxBytes)
+	}
+	available := maxBytes - len(notice)
+	headBytes := min(4096, available/4)
+	tailBytes := available - headBytes
+	return utf8Prefix(text, headBytes) + notice + utf8Suffix(text, tailBytes)
+}
+
+func utf8Prefix(text string, maxBytes int) string {
+	end := min(len(text), maxInt(maxBytes, 0))
+	for end > 0 && !utf8.ValidString(text[:end]) {
+		end--
+	}
+	return text[:end]
+}
+
+func utf8Suffix(text string, maxBytes int) string {
+	start := maxInt(len(text)-maxInt(maxBytes, 0), 0)
+	for start < len(text) && !utf8.ValidString(text[start:]) {
+		start++
+	}
+	return text[start:]
+}
+
+func messageRole(raw any) string {
+	msg, _ := raw.(map[string]any)
+	return stringValue(msg, "role", "")
+}
+
 func deriveSessionKey(surface, authToken string, payload map[string]any) string {
 	if explicit := strings.TrimSpace(anyString(payload["session_key"], "")); explicit != "" {
 		return explicit
@@ -1636,12 +1850,26 @@ func isReadLikeToolName(name string) bool {
 }
 
 func (app *App) prepareStandardRequest(ctx context.Context, r *http.Request, body map[string]any, defaultModel, surface, authToken string) (StandardRequest, error) {
-	preprocessed, err := app.preprocessAttachments(body, authToken)
+	payload := app.rewriteCachedFileHints(body, authToken)
+	workspaceRoot := deriveWorkspaceRoot(payload)
+	payload = injectWorkspaceNotice(payload, workspaceRoot)
+	payload, compacted := compactPayloadToPromptBudget(payload, defaultModel, surface, app.settings.ContextWindowMaxBytes)
+	if compacted.Compacted {
+		app.logInfo(ctx, "上下文窗口已裁剪",
+			"original_messages", compacted.OriginalMessages,
+			"retained_messages", compacted.RetainedMessages,
+			"dropped_turns", compacted.DroppedTurns,
+			"original_prompt_bytes", compacted.OriginalPromptBytes,
+			"final_prompt_bytes", compacted.FinalPromptBytes,
+			"latest_message_truncated", compacted.LatestMessageTruncated,
+		)
+	}
+	preprocessed, err := app.preprocessAttachments(payload, authToken)
 	if err != nil {
 		return StandardRequest{}, err
 	}
-	payload := app.rewriteCachedFileHints(preprocessed.Payload, authToken)
-	workspaceRoot := deriveWorkspaceRoot(payload)
+	payload = app.rewriteCachedFileHints(preprocessed.Payload, authToken)
+	workspaceRoot = deriveWorkspaceRoot(payload)
 	payload = injectWorkspaceNotice(payload, workspaceRoot)
 	req := buildChatStandardRequest(payload, defaultModel, surface)
 	clientProfile := detectClientProfile(r, req.Tools)
@@ -1651,6 +1879,17 @@ func (app *App) prepareStandardRequest(ctx context.Context, r *http.Request, bod
 	}
 	finalPayload := injectWorkspaceNotice(prepared.Payload, prepared.WorkspaceRoot)
 	finalPayload = app.rewriteCachedFileHints(finalPayload, authToken)
+	finalPayload, finalCompacted := compactPayloadToPromptBudget(finalPayload, defaultModel, surface, app.settings.ContextWindowMaxBytes)
+	if finalCompacted.Compacted {
+		app.logInfo(ctx, "最终上下文窗口已裁剪",
+			"original_messages", finalCompacted.OriginalMessages,
+			"retained_messages", finalCompacted.RetainedMessages,
+			"dropped_turns", finalCompacted.DroppedTurns,
+			"original_prompt_bytes", finalCompacted.OriginalPromptBytes,
+			"final_prompt_bytes", finalCompacted.FinalPromptBytes,
+			"latest_message_truncated", finalCompacted.LatestMessageTruncated,
+		)
+	}
 	req = buildChatStandardRequest(finalPayload, defaultModel, surface)
 	req.SessionKey = prepared.SessionKey
 	req.WorkspaceRoot = prepared.WorkspaceRoot
