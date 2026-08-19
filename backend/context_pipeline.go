@@ -146,15 +146,25 @@ type toolCallRef struct {
 type cachedFileContent struct {
 	Content   string
 	ExpiresAt time.Time
+	CreatedAt time.Time
+	SizeBytes int
 }
 
 type fileContentCache struct {
-	mu    sync.Mutex
-	items map[string]cachedFileContent
+	mu         sync.Mutex
+	items      map[string]cachedFileContent
+	totalBytes int
+	bounded    bool
 }
 
-func newFileContentCache() *fileContentCache {
-	return &fileContentCache{items: map[string]cachedFileContent{}}
+const (
+	fileContentCacheMaxItems = 1024
+	fileContentCacheMaxBytes = 32 << 20
+)
+
+func newFileContentCache(bounded ...bool) *fileContentCache {
+	enabled := len(bounded) > 0 && bounded[0]
+	return &fileContentCache{items: map[string]cachedFileContent{}, bounded: enabled}
 }
 
 func (c *fileContentCache) key(apiToken, filePath string) string {
@@ -170,13 +180,40 @@ func (c *fileContentCache) Put(apiToken, filePath, content string) {
 	now := time.Now()
 	for key, item := range c.items {
 		if !item.ExpiresAt.IsZero() && now.After(item.ExpiresAt) {
+			c.totalBytes -= item.SizeBytes
 			delete(c.items, key)
 		}
 	}
-	c.items[c.key(apiToken, filePath)] = cachedFileContent{
+	if c.bounded && len(content) > fileContentCacheMaxBytes {
+		return
+	}
+	cacheKey := c.key(apiToken, filePath)
+	if previous, ok := c.items[cacheKey]; ok {
+		c.totalBytes -= previous.SizeBytes
+		delete(c.items, cacheKey)
+	}
+	for c.bounded && (len(c.items) >= fileContentCacheMaxItems || c.totalBytes+len(content) > fileContentCacheMaxBytes) {
+		oldestKey := ""
+		oldestAt := now
+		for key, item := range c.items {
+			if oldestKey == "" || item.CreatedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = item.CreatedAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		c.totalBytes -= c.items[oldestKey].SizeBytes
+		delete(c.items, oldestKey)
+	}
+	c.items[cacheKey] = cachedFileContent{
 		Content:   content,
 		ExpiresAt: now.Add(fileContentCacheTTL),
+		CreatedAt: now,
+		SizeBytes: len(content),
 	}
+	c.totalBytes += len(content)
 }
 
 func (c *fileContentCache) Get(apiToken, filePath string) (string, bool) {
@@ -191,6 +228,7 @@ func (c *fileContentCache) Get(apiToken, filePath string) (string, bool) {
 		return "", false
 	}
 	if !item.ExpiresAt.IsZero() && time.Now().After(item.ExpiresAt) {
+		c.totalBytes -= item.SizeBytes
 		delete(c.items, key)
 		return "", false
 	}
@@ -1903,13 +1941,18 @@ func (app *App) prepareStandardRequest(ctx context.Context, r *http.Request, bod
 
 func (app *App) cleanupContextArtifacts(ctx context.Context) {
 	now := time.Now().Unix()
+	removedRecords := 0
+	removedFiles := 0
 	if records, err := app.loadUploadedLocalFiles(); err == nil {
 		next := records[:0]
 		changed := false
 		for _, record := range records {
 			expired := record.Ephemeral && record.CreatedAt > 0 && now-record.CreatedAt > int64(maxInt(app.settings.ContextAttachmentTTLSeconds, minSessionAffinityTTL))
 			if expired {
-				_ = safeRemoveGeneratedPath(app.settings.ContextGeneratedDir, record.Path)
+				if err := safeRemoveGeneratedPath(app.settings.ContextGeneratedDir, record.Path); err == nil {
+					removedFiles++
+				}
+				removedRecords++
 				changed = true
 				continue
 			}
@@ -1925,6 +1968,7 @@ func (app *App) cleanupContextArtifacts(ctx context.Context) {
 		for _, record := range records {
 			if record.ExpiresAt > 0 && record.ExpiresAt < now {
 				changed = true
+				removedRecords++
 				continue
 			}
 			next = append(next, record)
@@ -1939,6 +1983,7 @@ func (app *App) cleanupContextArtifacts(ctx context.Context) {
 		for _, record := range records {
 			if record.ExpiresAt > 0 && record.ExpiresAt < now {
 				changed = true
+				removedRecords++
 				continue
 			}
 			next = append(next, record)
@@ -1947,7 +1992,7 @@ func (app *App) cleanupContextArtifacts(ctx context.Context) {
 			_ = app.saveSessionAffinityRecords(next)
 		}
 	}
-	if app != nil {
-		app.logInfo(ctx, "上下文缓存清理完成")
+	if app != nil && (removedRecords > 0 || removedFiles > 0) {
+		app.logInfo(ctx, "上下文缓存清理完成", "removed_records", removedRecords, "removed_files", removedFiles)
 	}
 }

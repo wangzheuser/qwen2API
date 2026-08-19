@@ -138,23 +138,26 @@ func TestHasQwenVerificationCookieRequiresNonTokenCookie(t *testing.T) {
 
 func TestAccountPoolPrefersCookieBackedAccounts(t *testing.T) {
 	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	expiresAt := time.Now().Add(time.Hour).Unix()
 	pool.accounts = []*Account{
-		{Email: "plain@example.com", Token: "plain", Valid: true, StatusCode: "valid"},
-		{Email: "cookie@example.com", Token: "cookie", Cookies: "cna=abc", Valid: true, StatusCode: "valid"},
+		{Email: "plain@example.com", Token: "plain", TokenExpiresAt: expiresAt, Cookies: "token=plain", Valid: true, StatusCode: "valid"},
+		{Email: "cookie@example.com", Token: "cookie", TokenExpiresAt: expiresAt, Cookies: "cna=abc", Valid: true, StatusCode: "valid"},
 	}
 	pool.resetLocked()
 
 	acc := pool.pickLockedFor("", accountUsageChat)
 	if acc == nil || acc.Email != "cookie@example.com" {
-		t.Fatalf("expected cookie-backed account first, got %#v", acc)
+		t.Fatalf("expected browser cookie-backed account first, got %#v", acc)
 	}
 }
 
 func TestAccountPoolCookieBackedAcquireSkipsTokenOnlyAccounts(t *testing.T) {
 	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	expiresAt := time.Now().Add(time.Hour).Unix()
 	pool.accounts = []*Account{
-		{Email: "plain@example.com", Token: "plain", Valid: true, StatusCode: "valid"},
-		{Email: "cookie@example.com", Token: "cookie", Cookies: "cna=abc", Valid: true, StatusCode: "valid"},
+		{Email: "plain@example.com", Token: "plain", TokenExpiresAt: expiresAt, Valid: true, StatusCode: "valid"},
+		{Email: "token-cookie@example.com", Token: "token-cookie", TokenExpiresAt: expiresAt, Cookies: "token=abc; qwen_token=def", Valid: true, StatusCode: "valid"},
+		{Email: "cookie@example.com", Token: "cookie", TokenExpiresAt: expiresAt, Cookies: "cna=abc", Valid: true, StatusCode: "valid"},
 	}
 	pool.resetLocked()
 
@@ -234,6 +237,20 @@ func TestCompletionErrorPolicy(t *testing.T) {
 	}
 }
 
+func TestChatWAFErrorTemporarilyIsolatesAccount(t *testing.T) {
+	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
+	acc := &Account{Email: "waf@example.com", Token: "token", TokenExpiresAt: time.Now().Add(time.Hour).Unix(), Valid: true, StatusCode: "valid"}
+	pool.accounts = []*Account{acc}
+	pool.resetLocked()
+	app := &App{accounts: pool, settings: Settings{RateLimitBaseCooldown: 600}}
+
+	app.classifyAccountErrorFor(acc, errors.New("stream_chat blocked by Aliyun WAF"), accountUsageChat)
+
+	if acc.rateLimitedUntilFor(accountUsageChat) <= float64(time.Now().Unix()) {
+		t.Fatal("chat WAF rejection should temporarily isolate the affected account")
+	}
+}
+
 func TestCookieRefreshDoesNotExpandCooledPool(t *testing.T) {
 	pool := NewAccountPool(NewJSONStore(t.TempDir()+"/accounts.json", []any{}), Settings{MaxInflightPerAccount: 1}, nil)
 	acc := &Account{Email: "cooldown@example.com", Token: "token", Cookies: "cna=abc", Valid: true, StatusCode: "valid"}
@@ -255,9 +272,10 @@ func TestCanceledMediaRequestUsesClientClosedStatus(t *testing.T) {
 
 func TestTokenRefreshInitialDelayHonorsCancellation(t *testing.T) {
 	service := &TokenRefreshService{app: &App{settings: Settings{
-		TokenRefreshInitialDelaySeconds: 60,
-		TokenRefreshCheckInterval:       60,
-	}}}
+		TokenRefreshInitialDelaySeconds:     60,
+		TokenRefreshCheckInterval:           60,
+		TokenRefreshSlowScanIntervalSeconds: 60,
+	}}, store: &tokenRefreshStateStore{path: filepath.Join(t.TempDir(), "refresh.json")}, state: newTokenRefreshState()}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

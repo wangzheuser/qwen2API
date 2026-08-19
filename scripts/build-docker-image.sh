@@ -9,6 +9,9 @@ GOPROXY_VALUE="${GOPROXY:-https://goproxy.cn,direct}"
 INSTALL_BROWSERS="${INSTALL_BROWSERS:-true}"
 PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.57.0}"
 DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://mirrors.aliyun.com}"
+GO_IMAGE="${GO_IMAGE:-golang:1.26-bookworm}"
+NODE_IMAGE="${NODE_IMAGE:-node:20-bookworm-slim}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-debian:bookworm-slim}"
 
 docker buildx build \
   --platform "${PLATFORM}" \
@@ -16,6 +19,9 @@ docker buildx build \
   --build-arg "INSTALL_BROWSERS=${INSTALL_BROWSERS}" \
   --build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}" \
   --build-arg "DEBIAN_MIRROR=${DEBIAN_MIRROR}" \
+  --build-arg "GO_IMAGE=${GO_IMAGE}" \
+  --build-arg "NODE_IMAGE=${NODE_IMAGE}" \
+  --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
   -t "qwen2api:${IMAGE_TAG}" \
   --load \
   "${ROOT_DIR}"

@@ -35,7 +35,7 @@ func TestDueAccountsForRefresh(t *testing.T) {
 		{Email: "garbage", Password: "p", Token: "not-a-jwt", Source: "file"},               // 畸形
 	}
 	due := dueAccountsForRefresh(accounts, now, ahead)
-	if len(due) != 1 || due[0].Email != "expiring" {
-		t.Fatalf("want [expiring], got %v", refreshTestEmails(due))
+	if got := refreshTestEmails(due); len(got) != 3 || got[0] != "expiring" || got[1] != "expired" || got[2] != "garbage" {
+		t.Fatalf("want [expiring expired garbage], got %v", got)
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -51,6 +52,7 @@ type App struct {
 	logger         *slog.Logger
 	accounts       *AccountPool
 	client         *QwenClient
+	upstreamProxy  *UpstreamProxyPool
 	chatPool       *ChatIDPool
 	apiKeys        map[string]bool
 	managedAPIKeys map[string]bool
@@ -78,11 +80,23 @@ type App struct {
 	mediaCircuitReason    string
 	responsesMu           sync.Mutex
 	responses             map[string]storedResponseState
+	responsesBytes        int
+	readinessMu           sync.Mutex
+	lastReadiness         string
 }
 
 func main() {
 	settings := LoadSettings()
 	logger := newLogger(settings.LogLevel)
+	if len(os.Args) > 1 && os.Args[1] == "--token-refresh-self-test" {
+		result, err := runTokenRefreshSelfTest()
+		if err != nil {
+			logger.Error("token refresh self-test failed", "error_type", fmt.Sprintf("%T", err))
+			os.Exit(1)
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return
+	}
 	if strings.TrimSpace(settings.AdminKey) == "" {
 		logger.Warn("ADMIN_KEY is not set; configure it before using WebUI or admin APIs")
 	}
@@ -141,6 +155,9 @@ func main() {
 		}
 		stopBackground()
 	}
+	if app.tokenRefresh != nil {
+		app.tokenRefresh.Stop()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -172,7 +189,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 		contextCacheStore: NewJSONStore(settings.ContextCacheFile, []any{}),
 		uploadedFileStore: NewJSONStore(settings.UploadedFilesFile, []any{}),
 		sessionStore:      NewJSONStore(settings.ContextAffinityFile, []any{}),
-		fileContentCache:  newFileContentCache(),
+		fileContentCache:  newFileContentCache(settings.PerformanceReleaseStage == "B"),
 		videoTasks:        map[string]*VideoTask{},
 		mediaSlots:        make(chan struct{}, maxInt(settings.MediaMaxConcurrency, 1)),
 		responses:         map[string]storedResponseState{},
@@ -183,7 +200,15 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 	if err := app.accounts.Load(); err != nil {
 		return nil, err
 	}
-	app.client = NewQwenClient(app.accounts, settings, logger)
+	proxyPool, err := loadUpstreamProxyPool(settings.UpstreamProxyTemplateFile, settings.UpstreamProxyUUIDsFile)
+	if err != nil {
+		return nil, fmt.Errorf("load upstream proxy: %w", err)
+	}
+	app.upstreamProxy = proxyPool
+	if app.upstreamProxy != nil && app.upstreamProxy.enabled() {
+		logger.Info("上游身份固定出口代理已启用", "exits", len(app.upstreamProxy.uuids))
+	}
+	app.client = NewQwenClient(app.accounts, settings, logger, app.upstreamProxy)
 	app.chatPool = NewChatIDPool(app.client, app.accounts, settings, logger)
 	app.keepalive = NewKeepAliveService(logger)
 	app.tokenRefresh = NewTokenRefreshService(app, logger)
@@ -202,7 +227,7 @@ func (app *App) StartBackground(ctx context.Context) {
 		app.tokenRefresh.Start(ctx)
 	}
 	go func() {
-		ticker := time.NewTicker(time.Minute)
+		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
@@ -290,6 +315,7 @@ type Account struct {
 	Inflight         int                         `json:"inflight,omitempty"`
 	RateLimitedUntil float64                     `json:"rate_limited_until,omitempty"`
 	RateLimits       map[string]AccountRateLimit `json:"rate_limits,omitempty"`
+	TokenExpiresAt   int64                       `json:"-"`
 }
 
 type AccountRateLimit struct {
@@ -311,8 +337,17 @@ type AccountPool struct {
 	globalMaxInflight      int
 	recommendedConcurrency int
 	maxQueueSize           int
+	queued                 int
 	readySetEnabled        bool
+	loaded                 bool
+	stateChanged           chan struct{}
 }
+
+var (
+	errAccountQueueFull   = errors.New("upstream account queue is full")
+	errNoAvailableAccount = errors.New("no available upstream account")
+	accountAcquireTimeout = 60 * time.Second
+)
 
 const (
 	accountUsageChat     = "chat"
@@ -328,6 +363,9 @@ func NewAccountPool(store *JSONStore, settings Settings, logger *slog.Logger) *A
 		settings:              settings,
 		logger:                logger,
 		maxInflightPerAccount: maxInt(settings.MaxInflightPerAccount, 1),
+		globalMaxInflight:     maxInt(settings.GlobalMaxInflight, 1),
+		maxQueueSize:          maxInt(settings.MaxQueueSize, 1),
+		stateChanged:          make(chan struct{}, 1),
 	}
 }
 
@@ -365,12 +403,20 @@ func (p *AccountPool) Load() error {
 		}
 	}
 	p.resetLocked()
+	p.loaded = true
 	p.logger.Info("loaded upstream accounts", "count", len(p.accounts))
 	return nil
 }
 
 func (p *AccountPool) Save() error {
 	p.mu.Lock()
+	data := p.persistedAccountsLocked()
+	p.mu.Unlock()
+	return p.store.Save(data)
+}
+
+// persistedAccountsLocked 构造不包含运行时状态和环境账号的持久化快照。
+func (p *AccountPool) persistedAccountsLocked() []Account {
 	data := make([]Account, 0, len(p.accounts))
 	for _, acc := range p.accounts {
 		if acc.Source == "env" {
@@ -383,25 +429,45 @@ func (p *AccountPool) Save() error {
 		cp.syncLegacyRateLimit()
 		data = append(data, cp)
 	}
+	return data
+}
+
+// ApplyRefreshResults 批量应用刷新结果并只持久化一次账号文件。
+func (p *AccountPool) ApplyRefreshResults(results []Account) error {
+	if len(results) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	for i := range results {
+		results[i].normalize()
+		for index, existing := range p.accounts {
+			if existing.Email == results[i].Email && results[i].Email != "" {
+				cp := results[i]
+				p.accounts[index] = &cp
+				break
+			}
+		}
+	}
+	p.resetLocked()
+	data := p.persistedAccountsLocked()
 	p.mu.Unlock()
 	return p.store.Save(data)
 }
 
 func (p *AccountPool) resetLocked() {
-	valid := 0
 	available := 0
 	for _, acc := range p.accounts {
-		if acc.Valid {
-			valid++
-		}
 		if acc.availableFor(p.settings, accountUsageChat) {
 			available++
 		}
 	}
 	p.recommendedConcurrency = available * p.maxInflightPerAccount
-	p.globalMaxInflight = p.recommendedConcurrency
-	p.maxQueueSize = p.recommendedConcurrency
-	p.readySetEnabled = valid >= maxInt(p.settings.AccountReadySetThreshold, 1)
+	if p.settings.PerformanceReleaseStage != "B" {
+		p.globalMaxInflight = p.recommendedConcurrency
+		p.maxQueueSize = p.recommendedConcurrency
+	}
+	p.readySetEnabled = p.projectedUsableLocked(time.Now()) >= maxInt(p.settings.AccountReadySetThreshold, 1)
+	p.notifyLocked()
 }
 
 func (p *AccountPool) Snapshot() []Account {
@@ -427,9 +493,30 @@ func (p *AccountPool) Status() map[string]any {
 	available := 0
 	availableImage := 0
 	availableVideo := 0
+	usableChat := 0
+	usableMedia := 0
+	expired := 0
+	expiringWithinHorizon := 0
+	refreshable := 0
+	now := time.Now()
+	horizon := now.Add(time.Duration(maxInt(p.settings.TokenRefreshAheadSeconds, 0)) * time.Second).Unix()
 	for _, acc := range p.accounts {
 		if acc.Valid {
 			valid++
+		}
+		if acc.TokenExpiresAt <= now.Unix() {
+			expired++
+		} else if acc.TokenExpiresAt <= horizon {
+			expiringWithinHorizon++
+		}
+		if acc.refreshable() {
+			refreshable++
+		}
+		if acc.businessUsableAt(now.Unix()) {
+			usableChat++
+			if hasQwenVerificationCookie(acc.Cookies) {
+				usableMedia++
+			}
 		}
 		if acc.availableFor(p.settings, accountUsageChat) && acc.Inflight < p.maxInflightPerAccount {
 			available++
@@ -453,8 +540,40 @@ func (p *AccountPool) Status() map[string]any {
 		"global_max_inflight":      p.globalMaxInflight,
 		"max_queue_size":           p.maxQueueSize,
 		"global_in_use":            p.globalInUse,
+		"queued":                   p.queued,
 		"ready_set_enabled":        p.readySetEnabled,
 		"ready_set_threshold":      p.settings.AccountReadySetThreshold,
+		"ready_set_target":         p.settings.AccountReadySetThreshold,
+		"usable_chat":              usableChat,
+		"usable_media":             usableMedia,
+		"expired":                  expired,
+		"expiring_within_horizon":  expiringWithinHorizon,
+		"refreshable":              refreshable,
+		"projected_usable":         p.projectedUsableLocked(now),
+		"loaded":                   p.loaded,
+	}
+}
+
+// projectedUsableLocked 返回刷新窗口结束时仍可用于业务的账号数量。
+func (p *AccountPool) projectedUsableLocked(now time.Time) int {
+	horizon := now.Add(time.Duration(maxInt(p.settings.TokenRefreshAheadSeconds, 0)) * time.Second).Unix()
+	count := 0
+	for _, acc := range p.accounts {
+		if acc != nil && acc.Valid && acc.TokenExpiresAt > horizon {
+			count++
+		}
+	}
+	return count
+}
+
+// notifyLocked 通知一个等待中的请求重新检查账号池状态。
+func (p *AccountPool) notifyLocked() {
+	if p.stateChanged == nil {
+		return
+	}
+	select {
+	case p.stateChanged <- struct{}{}:
+	default:
 	}
 }
 
@@ -484,7 +603,7 @@ func (p *AccountPool) HasCookieBackedAvailableFor(usage string) bool {
 		return false
 	}
 	for _, acc := range p.accounts {
-		if strings.TrimSpace(acc.Cookies) == "" {
+		if !hasQwenVerificationCookie(acc.Cookies) {
 			continue
 		}
 		if acc.availableFor(p.settings, usage) && acc.Inflight < p.maxInflightPerAccount {
@@ -499,7 +618,7 @@ func (p *AccountPool) HasCookieBackedAccount() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, acc := range p.accounts {
-		if acc != nil && acc.Valid && acc.Token != "" && strings.TrimSpace(acc.Cookies) != "" {
+		if acc != nil && acc.businessUsableAt(time.Now().Unix()) && hasQwenVerificationCookie(acc.Cookies) {
 			return true
 		}
 	}
@@ -515,7 +634,7 @@ func (p *AccountPool) CookieRefreshCandidates(limit int) []Account {
 	}
 	out := make([]Account, 0, limit)
 	for _, acc := range p.accounts {
-		if acc == nil || !acc.Valid || acc.Token == "" || strings.TrimSpace(acc.Cookies) != "" || acc.ActivationPending {
+		if acc == nil || !acc.Valid || acc.Token == "" || hasQwenVerificationCookie(acc.Cookies) || acc.ActivationPending {
 			continue
 		}
 		cp := *acc
@@ -587,6 +706,7 @@ func (p *AccountPool) SetGlobalMaxInflight(value int) {
 	}
 	p.mu.Lock()
 	p.globalMaxInflight = value
+	p.notifyLocked()
 	p.mu.Unlock()
 }
 
@@ -595,36 +715,78 @@ func (p *AccountPool) Acquire(ctx context.Context, preferredEmail string) (*Acco
 }
 
 func (p *AccountPool) AcquireFor(ctx context.Context, preferredEmail, usage string) (*Account, error) {
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		p.mu.Lock()
-		acc := p.pickLockedFor(preferredEmail, usage)
-		if acc != nil {
-			now := float64(time.Now().UnixNano()) / 1e9
-			acc.Inflight++
-			acc.LastRequestStarted = now
-			p.globalInUse++
-			p.mu.Unlock()
-			return acc, nil
-		}
-		p.mu.Unlock()
-		if time.Now().After(deadline) {
-			return nil, errors.New("no available upstream account")
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(150 * time.Millisecond):
-		}
-	}
+	return p.acquireForOptions(ctx, preferredEmail, usage, false)
 }
 
 // AcquireCookieBackedFor 获取带浏览器 Cookie 验证态的账号，供媒体类 Qwen 请求使用。
 func (p *AccountPool) AcquireCookieBackedFor(ctx context.Context, preferredEmail, usage string) (*Account, error) {
-	deadline := time.Now().Add(60 * time.Second)
+	return p.acquireForOptions(ctx, preferredEmail, usage, true)
+}
+
+// acquireForOptions 使用状态通知等待账号，避免固定周期轮询和重复全量扫描。
+func (p *AccountPool) acquireForOptions(ctx context.Context, preferredEmail, usage string, requireCookies bool) (*Account, error) {
+	if p.settings.PerformanceReleaseStage != "B" {
+		return p.acquireForOptionsLegacy(ctx, preferredEmail, usage, requireCookies)
+	}
+	timer := time.NewTimer(accountAcquireTimeout)
+	defer timer.Stop()
+	queued := false
+	defer func() {
+		if !queued {
+			return
+		}
+		p.mu.Lock()
+		p.queued--
+		p.mu.Unlock()
+	}()
 	for {
 		p.mu.Lock()
-		acc := p.pickLockedForOptions(preferredEmail, usage, true)
+		acc := p.pickLockedForOptions(preferredEmail, usage, requireCookies)
+		if acc != nil {
+			now := float64(time.Now().UnixNano()) / 1e9
+			acc.Inflight++
+			acc.LastRequestStarted = now
+			p.globalInUse++
+			if queued {
+				p.queued--
+				queued = false
+			}
+			p.mu.Unlock()
+			p.notifyAvailable()
+			p.sleepRequestJitter(ctx)
+			return acc, nil
+		}
+		if !queued {
+			if p.maxQueueSize > 0 && p.queued >= p.maxQueueSize {
+				p.mu.Unlock()
+				return nil, errAccountQueueFull
+			}
+			p.queued++
+			queued = true
+		}
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			if requireCookies {
+				return nil, fmt.Errorf("%w with Qwen browser cookie", errNoAvailableAccount)
+			}
+			return nil, errNoAvailableAccount
+		case <-p.stateChanged:
+		}
+	}
+}
+
+// acquireForOptionsLegacy 保留发布 A 的轮询获取语义，发布 B 再切换通知队列。
+func (p *AccountPool) acquireForOptionsLegacy(ctx context.Context, preferredEmail, usage string, requireCookies bool) (*Account, error) {
+	timer := time.NewTimer(accountAcquireTimeout)
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer timer.Stop()
+	defer ticker.Stop()
+	for {
+		p.mu.Lock()
+		acc := p.pickLockedForOptionsLegacy(preferredEmail, usage, requireCookies)
 		if acc != nil {
 			now := float64(time.Now().UnixNano()) / 1e9
 			acc.Inflight++
@@ -634,15 +796,34 @@ func (p *AccountPool) AcquireCookieBackedFor(ctx context.Context, preferredEmail
 			return acc, nil
 		}
 		p.mu.Unlock()
-		if time.Now().After(deadline) {
-			return nil, errors.New("no available upstream account with Qwen browser cookie")
-		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(150 * time.Millisecond):
+		case <-timer.C:
+			if requireCookies {
+				return nil, fmt.Errorf("%w with Qwen browser cookie", errNoAvailableAccount)
+			}
+			return nil, errNoAvailableAccount
+		case <-ticker.C:
 		}
 	}
+}
+
+// sleepRequestJitter 在账号池锁外执行请求抖动。
+func (p *AccountPool) sleepRequestJitter(ctx context.Context) {
+	if p.settings.RequestJitterMaxMS <= 0 {
+		return
+	}
+	minDelay := maxInt(p.settings.RequestJitterMinMS, 0)
+	maxDelay := maxInt(p.settings.RequestJitterMaxMS, minDelay)
+	sleepWithContext(ctx, time.Duration(minDelay+mathrand.Intn(maxDelay-minDelay+1))*time.Millisecond)
+}
+
+// notifyAvailable 唤醒一个等待账号的请求。
+func (p *AccountPool) notifyAvailable() {
+	p.mu.Lock()
+	p.notifyLocked()
+	p.mu.Unlock()
 }
 
 func (p *AccountPool) pickLocked(preferredEmail string) *Account {
@@ -654,10 +835,25 @@ func (p *AccountPool) pickLockedFor(preferredEmail, usage string) *Account {
 }
 
 func (p *AccountPool) pickLockedForOptions(preferredEmail, usage string, requireCookies bool) *Account {
+	if p.settings.PerformanceReleaseStage != "B" {
+		return p.pickLockedForOptionsLegacy(preferredEmail, usage, requireCookies)
+	}
 	if p.globalMaxInflight > 0 && p.globalInUse >= p.globalMaxInflight {
 		return nil
 	}
-	var candidates []*Account
+	best := p.pickBestLocked(preferredEmail, usage, requireCookies)
+	if best == nil && preferredEmail != "" {
+		best = p.pickBestLocked("", usage, requireCookies)
+	}
+	return best
+}
+
+// pickLockedForOptionsLegacy 保留发布 A 的候选排序和锁内 jitter 行为。
+func (p *AccountPool) pickLockedForOptionsLegacy(preferredEmail, usage string, requireCookies bool) *Account {
+	if p.globalMaxInflight > 0 && p.globalInUse >= p.globalMaxInflight {
+		return nil
+	}
+	candidates := make([]*Account, 0)
 	for _, acc := range p.accounts {
 		if preferredEmail != "" && acc.Email != preferredEmail {
 			continue
@@ -665,25 +861,19 @@ func (p *AccountPool) pickLockedForOptions(preferredEmail, usage string, require
 		if !acc.availableFor(p.settings, usage) || acc.Inflight >= p.maxInflightPerAccount {
 			continue
 		}
-		if requireCookies && strings.TrimSpace(acc.Cookies) == "" {
+		if requireCookies && !hasQwenVerificationCookie(acc.Cookies) {
 			continue
 		}
 		candidates = append(candidates, acc)
 	}
 	if preferredEmail != "" && len(candidates) == 0 {
-		return p.pickLockedForOptions("", usage, requireCookies)
+		return p.pickLockedForOptionsLegacy("", usage, requireCookies)
 	}
 	if len(candidates) == 0 {
 		return nil
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		if (candidates[i].Cookies != "") != (candidates[j].Cookies != "") {
-			return candidates[i].Cookies != ""
-		}
-		if candidates[i].Inflight != candidates[j].Inflight {
-			return candidates[i].Inflight < candidates[j].Inflight
-		}
-		return candidates[i].LastRequestStarted < candidates[j].LastRequestStarted
+		return betterAccountCandidate(candidates[i], candidates[j], requireCookies)
 	})
 	if p.settings.RequestJitterMaxMS > 0 {
 		minDelay := maxInt(p.settings.RequestJitterMinMS, 0)
@@ -691,6 +881,37 @@ func (p *AccountPool) pickLockedForOptions(preferredEmail, usage string, require
 		time.Sleep(time.Duration(minDelay+mathrand.Intn(maxDelay-minDelay+1)) * time.Millisecond)
 	}
 	return candidates[0]
+}
+
+// pickBestLocked 单次扫描选择最空闲账号，避免分配并排序完整候选集。
+func (p *AccountPool) pickBestLocked(preferredEmail, usage string, requireCookies bool) *Account {
+	var best *Account
+	for _, acc := range p.accounts {
+		if preferredEmail != "" && acc.Email != preferredEmail {
+			continue
+		}
+		if !acc.availableFor(p.settings, usage) || acc.Inflight >= p.maxInflightPerAccount {
+			continue
+		}
+		if requireCookies && !hasQwenVerificationCookie(acc.Cookies) {
+			continue
+		}
+		if best == nil || betterAccountCandidate(acc, best, requireCookies) {
+			best = acc
+		}
+	}
+	return best
+}
+
+// betterAccountCandidate 保留浏览器 Cookie、低并发和最近使用时间优先级。
+func betterAccountCandidate(candidate, current *Account, requireCookies bool) bool {
+	if hasQwenVerificationCookie(candidate.Cookies) != hasQwenVerificationCookie(current.Cookies) {
+		return hasQwenVerificationCookie(candidate.Cookies)
+	}
+	if candidate.Inflight != current.Inflight {
+		return candidate.Inflight < current.Inflight
+	}
+	return candidate.LastRequestStarted < current.LastRequestStarted
 }
 
 func (p *AccountPool) Release(acc *Account) {
@@ -705,6 +926,7 @@ func (p *AccountPool) Release(acc *Account) {
 		p.globalInUse--
 	}
 	acc.LastRequestFinished = float64(time.Now().UnixNano()) / 1e9
+	p.notifyLocked()
 	p.mu.Unlock()
 }
 
@@ -736,6 +958,7 @@ func (p *AccountPool) MarkInvalid(acc *Account, status, message string) {
 	acc.StatusCode = status
 	acc.LastError = message
 	acc.ConsecutiveFailures++
+	p.resetLocked()
 	p.mu.Unlock()
 	_ = p.Save()
 }
@@ -800,6 +1023,7 @@ func (a *Account) normalize() {
 		}
 	}
 	a.Valid = !a.ActivationPending && a.StatusCode != "invalid" && a.StatusCode != "auth_error" && a.StatusCode != "banned"
+	a.TokenExpiresAt = int64(tokenExpiry(a.Token))
 	a.compactRateLimits()
 }
 
@@ -808,7 +1032,7 @@ func (a *Account) available(settings Settings) bool {
 }
 
 func (a *Account) availableFor(settings Settings, usage string) bool {
-	if a == nil || !a.Valid || a.Token == "" {
+	if a == nil || !a.businessUsableAt(time.Now().Unix()) {
 		return false
 	}
 	now := float64(time.Now().UnixNano()) / 1e9
@@ -817,6 +1041,16 @@ func (a *Account) availableFor(settings Settings, usage string) bool {
 	}
 	minInterval := float64(maxInt(settings.AccountMinIntervalMS, 0)) / 1000.0
 	return a.LastRequestStarted+minInterval <= now
+}
+
+// businessUsableAt 判断账号 token 在给定时间是否仍可用于业务请求。
+func (a *Account) businessUsableAt(unix int64) bool {
+	return a != nil && a.Valid && strings.TrimSpace(a.Token) != "" && a.TokenExpiresAt > unix
+}
+
+// refreshable 判断账号是否允许通过密码重新获取 token。
+func (a *Account) refreshable() bool {
+	return a != nil && strings.TrimSpace(a.Password) != "" && a.Source != "env" && !a.ActivationPending
 }
 
 func (a *Account) status() string {
@@ -1000,11 +1234,74 @@ const (
 	mailBaseURL = "https://mail.chatgpt.org.uk"
 )
 
+type browserTaskGate struct {
+	mu          sync.Mutex
+	active      bool
+	highWaiters int
+	changed     chan struct{}
+}
+
+// newBrowserTaskGate 创建管理端任务优先的全局浏览器门闩。
+func newBrowserTaskGate() *browserTaskGate {
+	return &browserTaskGate{changed: make(chan struct{})}
+}
+
+// lock 等待浏览器执行权；高优先级等待者会阻止新的自动任务抢占。
+func (g *browserTaskGate) lock(ctx context.Context, highPriority bool) error {
+	g.mu.Lock()
+	if g.changed == nil {
+		g.changed = make(chan struct{})
+	}
+	registeredHigh := highPriority
+	if registeredHigh {
+		g.highWaiters++
+	}
+	for {
+		if !g.active && (highPriority || g.highWaiters == 0) {
+			g.active = true
+			if registeredHigh {
+				g.highWaiters--
+				registeredHigh = false
+			}
+			g.mu.Unlock()
+			return nil
+		}
+		changed := g.changed
+		g.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			g.mu.Lock()
+			if registeredHigh {
+				g.highWaiters--
+				g.signalLocked()
+			}
+			g.mu.Unlock()
+			return ctx.Err()
+		case <-changed:
+			g.mu.Lock()
+		}
+	}
+}
+
+// signalLocked 唤醒所有等待者重新进行优先级判定。
+func (g *browserTaskGate) signalLocked() {
+	close(g.changed)
+	g.changed = make(chan struct{})
+}
+
+// Unlock 释放浏览器执行权。
+func (g *browserTaskGate) Unlock() {
+	g.mu.Lock()
+	g.active = false
+	g.signalLocked()
+	g.mu.Unlock()
+}
+
 var (
-	browserAutomationMu sync.Mutex
-	playwrightInstallMu sync.Mutex
-	playwrightInstalled bool
-	mailLinkKeywords    = []string{"qwen", "verify", "activate", "confirm", "aliyun", "alibaba", "qwenlm"}
+	browserAutomationGate = newBrowserTaskGate()
+	playwrightInstallMu   sync.Mutex
+	playwrightInstalled   bool
+	mailLinkKeywords      = []string{"qwen", "verify", "activate", "confirm", "aliyun", "alibaba", "qwenlm"}
 )
 
 type MailSession struct {
@@ -1241,8 +1538,10 @@ func extractVerifyLinkFromEmailRecord(msg map[string]any) string {
 }
 
 func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, bool, error) {
-	browserAutomationMu.Lock()
-	defer browserAutomationMu.Unlock()
+	if err := browserAutomationGate.lock(ctx, true); err != nil {
+		return acc, false, err
+	}
+	defer browserAutomationGate.Unlock()
 
 	if app.logger != nil {
 		app.logger.Info("账号激活流程开始", "account", acc.Email)
@@ -1251,7 +1550,7 @@ func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, 
 		if app.logger != nil {
 			app.logger.Info("账号激活先尝试用现有 token 刷新浏览器会话", "account", acc.Email)
 		}
-		if err := app.withBrowser(ctx, func(page pw.Page) error {
+		if err := app.withBrowser(ctx, acc, func(page pw.Page) error {
 			cookies, err := refreshQwenBrowserSession(ctx, page, acc.Token)
 			if err != nil {
 				return err
@@ -1279,7 +1578,7 @@ func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, 
 	if app.logger != nil {
 		app.logger.Info("账号激活邮件轮询完成", "account", acc.Email, "link_found", verifyLink != "")
 	}
-	err := app.withBrowser(ctx, func(page pw.Page) error {
+	err := app.withBrowser(ctx, acc, func(page pw.Page) error {
 		if verifyLink == "" {
 			if app.logger != nil {
 				app.logger.Info("账号激活尝试从邮箱页面查找链接", "account", acc.Email)
@@ -1357,50 +1656,56 @@ func (app *App) refreshAccountToken(ctx context.Context, acc Account) (Account, 
 		return acc, false
 	}
 	// 复用全局浏览器锁，避免与激活流程并发拉起浏览器。
-	browserAutomationMu.Lock()
-	defer browserAutomationMu.Unlock()
-
-	if app.logger != nil {
-		app.logger.Info("token 主动刷新：开始重新登录", "account", acc.Email)
+	if err := browserAutomationGate.lock(ctx, true); err != nil {
+		return acc, false
 	}
-	var newToken string
-	err := app.withBrowser(ctx, func(page pw.Page) error {
-		newToken = loginAndGetToken(ctx, page, acc.Email, acc.Password, 30*time.Second)
-		if newToken == "" {
-			// 登录未直接返回 token 时，兜底读一次 localStorage。
-			newToken = localStorageToken(page)
-		}
-		if newToken == "" {
-			return errors.New("login did not yield token")
-		}
-		acc.Cookies = qwenCookieString(page)
-		return nil
+	defer browserAutomationGate.Unlock()
+
+	err := app.withBrowser(ctx, acc, func(page pw.Page) error {
+		var refreshErr error
+		acc, refreshErr = app.refreshAccountTokenWithPage(ctx, page, acc)
+		return refreshErr
 	})
 	if err != nil {
 		if app.logger != nil {
-			app.logger.Warn("token 主动刷新：登录失败", "account", acc.Email, "error", err)
+			app.logger.Debug("token 主动刷新失败", "error_class", classifyRefreshError(err))
 		}
 		return acc, false
-	}
-	// 官网复验，确认新 token 真正可用再落库。
-	if !app.client.VerifyToken(ctx, newToken) {
-		if app.logger != nil {
-			app.logger.Warn("token 主动刷新：新 token 复验未通过", "account", acc.Email)
-		}
-		return acc, false
-	}
-	acc.Token = newToken
-	acc.Valid = true
-	acc.ActivationPending = false
-	acc.StatusCode = "valid"
-	acc.LastError = "token 已通过主动刷新更新"
-	if app.logger != nil {
-		app.logger.Info("token 主动刷新：成功", "account", acc.Email)
 	}
 	return acc, true
 }
 
-func (app *App) withBrowser(ctx context.Context, fn func(page pw.Page) error) error {
+// refreshAccountTokenWithPage 在已启动的浏览器上下文中刷新单个账号。
+func (app *App) refreshAccountTokenWithPage(ctx context.Context, page pw.Page, acc Account) (Account, error) {
+	newToken := loginAndGetToken(ctx, page, acc.Email, acc.Password, 30*time.Second)
+	if newToken == "" {
+		// 登录未直接返回 token 时，兜底读取一次 localStorage。
+		newToken = localStorageToken(page)
+	}
+	if ctx.Err() != nil {
+		return acc, ctx.Err()
+	}
+	if newToken == "" {
+		return acc, errors.New("login timeout: token was not available")
+	}
+	acc.Cookies = qwenCookieString(page)
+	// 官网复验通过后才将新 token 写入账号池。
+	if !app.client.VerifyToken(ctx, newToken) {
+		return acc, errors.New("token verify failed")
+	}
+	acc.Token = newToken
+	acc.TokenExpiresAt = int64(tokenExpiry(newToken))
+	if acc.TokenExpiresAt <= time.Now().Unix() {
+		return acc, errors.New("token verify returned expired token")
+	}
+	acc.Valid = true
+	acc.ActivationPending = false
+	acc.StatusCode = "valid"
+	acc.LastError = "token 已通过主动刷新更新"
+	return acc, nil
+}
+
+func (app *App) withBrowser(ctx context.Context, acc Account, fn func(page pw.Page) error) error {
 	if err := installPlaywrightBrowsers(app.logger); err != nil {
 		return fmt.Errorf("playwright install failed: %w", err)
 	}
@@ -1413,11 +1718,7 @@ func (app *App) withBrowser(ctx context.Context, fn func(page pw.Page) error) er
 	browser, err := runner.Chromium.Launch(pw.BrowserTypeLaunchOptions{
 		Headless: pw.Bool(true),
 		Timeout:  pw.Float(60000),
-		Args: []string{
-			"--disable-dev-shm-usage",
-			"--disable-blink-features=AutomationControlled",
-			"--no-sandbox",
-		},
+		Args:     browserLaunchArgs(app.settings.BrowserDisableDevShmUsage),
 	})
 	if err != nil {
 		return fmt.Errorf("browser launch failed: %w", err)
@@ -1428,6 +1729,7 @@ func (app *App) withBrowser(ctx context.Context, fn func(page pw.Page) error) er
 		UserAgent: pw.String("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"),
 		Locale:    pw.String("zh-CN"),
 		Viewport:  &pw.Size{Width: 1365, Height: 768},
+		Proxy:     app.upstreamProxy.playwrightProxyForIdentity(qwenIdentityFromAccount(&acc)),
 		ExtraHttpHeaders: map[string]string{
 			"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 		},
@@ -1975,7 +2277,7 @@ func (p *ChatIDPool) cleanup(ctx context.Context, deleteAll bool) {
 	}
 	p.mu.Unlock()
 	for _, item := range expired {
-		p.client.DeleteChat(context.Background(), item.Token, item.ChatID)
+		p.client.DeleteChatForIdentity(context.Background(), QwenRequestIdentity{Token: item.Token, Email: item.Email}, item.ChatID)
 	}
 	if len(expired) > 0 {
 		logInfo(p.logger, ctx, "清理预热会话", "count", len(expired), "delete_all", deleteAll)
@@ -2030,7 +2332,10 @@ type Settings struct {
 	Workers                                int
 	AdminKey                               string
 	BrowserPoolSize                        int
+	BrowserDisableDevShmUsage              bool
 	MaxInflightPerAccount                  int
+	GlobalMaxInflight                      int
+	MaxQueueSize                           int
 	BrowserStreamTimeoutSeconds            int
 	UpstreamStreamHeaderTimeoutSeconds     int
 	UpstreamStreamFirstEventTimeoutSeconds int
@@ -2067,6 +2372,15 @@ type Settings struct {
 	TokenRefreshCheckInterval              int
 	TokenRefreshAheadSeconds               int
 	TokenRefreshStaggerMS                  int
+	TokenRefreshStateFile                  string
+	TokenRefreshBatchSize                  int
+	TokenRefreshBatchTimeoutSeconds        int
+	TokenRefreshSlowScanIntervalSeconds    int
+	TokenRefreshBreakerFailures            int
+	TokenRefreshBreakerCooldownSeconds     int
+	PerformanceReleaseStage                string
+	UpstreamProxyTemplateFile              string
+	UpstreamProxyUUIDsFile                 string
 
 	BaseDir                          string
 	DataDir                          string
@@ -2101,12 +2415,19 @@ func LoadSettings() Settings {
 	data := envString("DATA_DIR", filepath.Join(base, "data"))
 	logs := envString("LOGS_DIR", filepath.Join(base, "logs"))
 	maxRetries := envInt("MAX_RETRIES", 3)
+	performanceReleaseStage := strings.ToUpper(envString("PERFORMANCE_RELEASE_STAGE", "A"))
+	if performanceReleaseStage != "B" {
+		performanceReleaseStage = "A"
+	}
 	settings := Settings{
 		Port:                                   envInt("PORT", 7860),
 		Workers:                                envInt("WORKERS", 1),
 		AdminKey:                               envString("ADMIN_KEY", ""),
 		BrowserPoolSize:                        envInt("BROWSER_POOL_SIZE", 1),
+		BrowserDisableDevShmUsage:              envBool("BROWSER_DISABLE_DEV_SHM_USAGE", performanceReleaseStage != "B"),
 		MaxInflightPerAccount:                  envIntAlias("MAX_INFLIGHT_PER_ACCOUNT", "MAX_INFLIGHT", 2),
+		GlobalMaxInflight:                      maxInt(envInt("GLOBAL_MAX_INFLIGHT", 32), 1),
+		MaxQueueSize:                           maxInt(envInt("MAX_QUEUE_SIZE", 64), 1),
 		BrowserStreamTimeoutSeconds:            envInt("BROWSER_STREAM_TIMEOUT_SECONDS", 1800),
 		UpstreamStreamHeaderTimeoutSeconds:     envInt("UPSTREAM_STREAM_HEADER_TIMEOUT_SECONDS", 120),
 		UpstreamStreamFirstEventTimeoutSeconds: envInt("UPSTREAM_STREAM_FIRST_EVENT_TIMEOUT_SECONDS", 180),
@@ -2140,9 +2461,18 @@ func LoadSettings() Settings {
 		KeepAliveInterval:                      clampInt(envInt("KEEPALIVE_INTERVAL", keepAliveDefaultInterval), keepAliveMinInterval, keepAliveMaxInterval),
 		TokenRefreshEnabled:                    envBool("TOKEN_REFRESH_ENABLED", true),
 		TokenRefreshInitialDelaySeconds:        maxInt(envInt("TOKEN_REFRESH_INITIAL_DELAY_SECONDS", 0), 0),
-		TokenRefreshCheckInterval:              envInt("TOKEN_REFRESH_CHECK_INTERVAL", 21600),
+		TokenRefreshCheckInterval:              maxInt(envInt("TOKEN_REFRESH_CHECK_INTERVAL", 300), 1),
 		TokenRefreshAheadSeconds:               envInt("TOKEN_REFRESH_AHEAD_SECONDS", 259200),
 		TokenRefreshStaggerMS:                  envInt("TOKEN_REFRESH_STAGGER_MS", 2000),
+		TokenRefreshStateFile:                  envString("TOKEN_REFRESH_STATE_FILE", filepath.Join(data, "token_refresh_state.json")),
+		TokenRefreshBatchSize:                  maxInt(envInt("TOKEN_REFRESH_BATCH_SIZE", 5), 1),
+		TokenRefreshBatchTimeoutSeconds:        maxInt(envInt("TOKEN_REFRESH_BATCH_TIMEOUT_SECONDS", 600), 1),
+		TokenRefreshSlowScanIntervalSeconds:    maxInt(envInt("TOKEN_REFRESH_SLOW_SCAN_INTERVAL_SECONDS", 1800), 1),
+		TokenRefreshBreakerFailures:            maxInt(envInt("TOKEN_REFRESH_BREAKER_FAILURES", 5), 1),
+		TokenRefreshBreakerCooldownSeconds:     maxInt(envInt("TOKEN_REFRESH_BREAKER_COOLDOWN_SECONDS", 21600), 1),
+		PerformanceReleaseStage:                performanceReleaseStage,
+		UpstreamProxyTemplateFile:              envString("UPSTREAM_PROXY_TEMPLATE_FILE", ""),
+		UpstreamProxyUUIDsFile:                 envString("UPSTREAM_PROXY_UUIDS_FILE", ""),
 		BaseDir:                                base,
 		DataDir:                                data,
 		LogsDir:                                logs,
@@ -2599,16 +2929,15 @@ func (s *KeepAliveService) Status() map[string]any {
 	}
 }
 
-// dueAccountsForRefresh 筛出临近过期且可主动刷新的账号。
-// 条件：有密码、非 env 源，且 token 剩余寿命落在 (0, ahead) 区间——已过期或解析失败一律跳过。
+// dueAccountsForRefresh 筛出已过期、异常或在刷新窗口内到期的可恢复账号。
 func dueAccountsForRefresh(accounts []Account, now, ahead float64) []Account {
 	due := make([]Account, 0)
 	for _, acc := range accounts {
-		if acc.Password == "" || acc.Source == "env" {
+		acc.TokenExpiresAt = int64(tokenExpiry(acc.Token))
+		if !acc.refreshable() {
 			continue
 		}
-		remaining := tokenExpiry(acc.Token) - now
-		if remaining > 0 && remaining < ahead {
+		if float64(acc.TokenExpiresAt) <= now+ahead {
 			due = append(due, acc)
 		}
 	}
@@ -2636,132 +2965,6 @@ func tokenExpiry(token string) float64 {
 		return 0
 	}
 	return claims.Exp
-}
-
-type TokenRefreshService struct {
-	app    *App
-	logger *slog.Logger
-
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	running bool
-
-	lastRun        float64
-	lastRefresh    float64
-	refreshedTotal int
-	failedTotal    int
-	lastError      string
-}
-
-func NewTokenRefreshService(app *App, logger *slog.Logger) *TokenRefreshService {
-	return &TokenRefreshService{app: app, logger: logger}
-}
-
-func (s *TokenRefreshService) Start(parent context.Context) {
-	if s == nil || !s.app.settings.TokenRefreshEnabled {
-		if s != nil && s.logger != nil {
-			s.logger.Info("token 主动刷新未启用，服务不启动")
-		}
-		return
-	}
-	s.mu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	ctx, cancel := context.WithCancel(parent)
-	s.cancel = cancel
-	s.running = true
-	s.mu.Unlock()
-	go s.run(ctx)
-}
-
-func (s *TokenRefreshService) Stop() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	s.running = false
-	s.mu.Unlock()
-}
-
-func (s *TokenRefreshService) run(ctx context.Context) {
-	interval := time.Duration(s.app.settings.TokenRefreshCheckInterval) * time.Second
-	stagger := time.Duration(s.app.settings.TokenRefreshStaggerMS) * time.Millisecond
-	ahead := float64(s.app.settings.TokenRefreshAheadSeconds)
-	if delay := time.Duration(s.app.settings.TokenRefreshInitialDelaySeconds) * time.Second; delay > 0 {
-		if s.logger != nil {
-			s.logger.Info("token 主动刷新等待启动", "delay_s", s.app.settings.TokenRefreshInitialDelaySeconds)
-		}
-		sleepWithContext(ctx, delay)
-		if ctx.Err() != nil {
-			return
-		}
-	}
-	if s.logger != nil {
-		s.logger.Info("token 主动刷新任务启动", "interval_s", s.app.settings.TokenRefreshCheckInterval, "ahead_s", s.app.settings.TokenRefreshAheadSeconds)
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		now := float64(time.Now().Unix())
-		s.mu.Lock()
-		s.lastRun = now
-		s.mu.Unlock()
-		due := dueAccountsForRefresh(s.app.accounts.Snapshot(), now, ahead)
-		if len(due) > 0 && s.logger != nil {
-			s.logger.Info("token 主动刷新本轮待刷新账号", "count", len(due))
-		}
-		for _, acc := range due {
-			if ctx.Err() != nil {
-				return
-			}
-			updated, ok := s.app.refreshAccountToken(ctx, acc)
-			s.mu.Lock()
-			if ok {
-				s.refreshedTotal++
-				s.lastRefresh = float64(time.Now().Unix())
-			} else {
-				s.failedTotal++
-			}
-			s.mu.Unlock()
-			if ok {
-				if err := s.app.accounts.Add(updated); err != nil {
-					s.mu.Lock()
-					s.lastError = err.Error()
-					s.mu.Unlock()
-				}
-			}
-			sleepWithContext(ctx, stagger)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func (s *TokenRefreshService) Status() map[string]any {
-	if s == nil {
-		return map[string]any{"running": false}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return map[string]any{
-		"running":         s.running,
-		"enabled":         s.app.settings.TokenRefreshEnabled,
-		"check_interval":  s.app.settings.TokenRefreshCheckInterval,
-		"ahead_seconds":   s.app.settings.TokenRefreshAheadSeconds,
-		"last_run":        s.lastRun,
-		"last_refresh":    s.lastRefresh,
-		"refreshed_total": s.refreshedTotal,
-		"failed_total":    s.failedTotal,
-		"last_error":      s.lastError,
-	}
 }
 
 func (app *App) keepaliveConfig() KeepAliveConfig {
@@ -2931,7 +3134,48 @@ func (app *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) handleReady(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "accounts": app.accounts.Status()})
+	accountStatus := app.accounts.Status()
+	refreshStatus := app.tokenRefresh.Status()
+	usableChat, _ := accountStatus["usable_chat"].(int)
+	usableMedia, _ := accountStatus["usable_media"].(int)
+	accountsLoaded, _ := accountStatus["loaded"].(bool)
+	refreshLoaded, _ := refreshStatus["loaded"].(bool)
+	ready := usableChat > 0 && usableMedia > 0 && accountsLoaded && refreshLoaded
+	state := "degraded"
+	statusCode := http.StatusServiceUnavailable
+	if ready {
+		state = "ready"
+		statusCode = http.StatusOK
+	}
+	app.readinessMu.Lock()
+	previous := app.lastReadiness
+	app.lastReadiness = state
+	app.readinessMu.Unlock()
+	if previous != "" && previous != state && app.logger != nil {
+		app.logger.Info("业务就绪状态变化", "from", previous, "to", state, "usable_chat", usableChat, "usable_media", usableMedia)
+	}
+	nextRunAt := int64(0)
+	if fast, ok := refreshStatus["next_fast_run_at"].(int64); ok {
+		nextRunAt = fast
+	}
+	if slow, ok := refreshStatus["next_slow_run_at"].(int64); ok && (nextRunAt == 0 || slow < nextRunAt) {
+		nextRunAt = slow
+	}
+	writeJSON(w, statusCode, map[string]any{
+		"status": state,
+		"accounts": map[string]any{
+			"usable_chat":      usableChat,
+			"usable_media":     usableMedia,
+			"expired":          accountStatus["expired"],
+			"projected_usable": accountStatus["projected_usable"],
+			"ready_set_target": accountStatus["ready_set_target"],
+		},
+		"refresh": map[string]any{
+			"phase":         refreshStatus["phase"],
+			"breaker_state": refreshStatus["breaker_state"],
+			"next_run_at":   nextRunAt,
+		},
+	})
 }
 
 func (app *App) handleKeepAlive(w http.ResponseWriter, r *http.Request) {
@@ -3109,7 +3353,7 @@ func (app *App) runCompletionAttemptWithHooks(ctx context.Context, req StandardR
 		return CompletionResult{}, err
 	}
 	defer app.accounts.Release(acc)
-	defer asyncDeleteChat(app.client, acc.Token, chatID)
+	defer asyncDeleteChat(app.client, qwenIdentityFromAccount(acc), chatID)
 	setRequestLogFields(ctx, "chat_id", chatID)
 	app.logInfo(ctx, "创建上游会话", "chat_type", req.ChatType, "prewarmed", reused)
 
@@ -4291,13 +4535,13 @@ func firstRepeatedToolName(calls []ParsedToolCall) string {
 	return ""
 }
 
-func asyncDeleteChat(client *QwenClient, token, chatID string) {
-	if client == nil || strings.TrimSpace(token) == "" || strings.TrimSpace(chatID) == "" {
+func asyncDeleteChat(client *QwenClient, identity QwenRequestIdentity, chatID string) {
+	if client == nil || strings.TrimSpace(identity.Token) == "" || strings.TrimSpace(chatID) == "" {
 		return
 	}
-	tokenCopy := token
+	identityCopy := identity
 	chatIDCopy := chatID
-	go client.DeleteChat(context.Background(), tokenCopy, chatIDCopy)
+	go client.DeleteChatForIdentity(context.Background(), identityCopy, chatIDCopy)
 }
 
 func (app *App) recoverBlockedToolNameOutput(ctx context.Context, acc *Account, req StandardRequest, result CompletionResult) CompletionResult {
@@ -4594,7 +4838,7 @@ func (app *App) runToolMarkupRecoveryAttempt(ctx context.Context, acc *Account, 
 		app.classifyAccountError(acc, err)
 		return CompletionResult{}, err
 	}
-	defer asyncDeleteChat(app.client, acc.Token, chatID)
+	defer asyncDeleteChat(app.client, qwenIdentityFromAccount(acc), chatID)
 	app.logInfo(ctx, "[Retry] recovery chat created", "reason", reason, "recovery_chat_id", chatID)
 	payload := buildChatPayload(chatID, req.ResolvedModel, prompt, req.ToolEnabled, req.UpstreamFiles, req.ChatType, nil, req.ThinkingEnabled, req.EnableSearch)
 	result := CompletionResult{FinishReason: "stop"}
@@ -4917,12 +5161,15 @@ func (app *App) classifyAccountErrorFor(acc *Account, err error, usage string) {
 	}
 	if isUpstreamWAFErrorMessage(lower) {
 		normalizedUsage := normalizeAccountUsage(usage)
+		cooldown := transientUpstreamCooldownSeconds(app.settings)
 		if normalizedUsage == accountUsageImage || normalizedUsage == accountUsageVideo {
-			app.accounts.MarkRateLimitedFor(acc, normalizedUsage, app.settings.MediaWAFBreakerCooldownSeconds, msg)
-			app.tripMediaCircuit(err, "waf", app.settings.MediaWAFBreakerCooldownSeconds)
+			cooldown = app.settings.MediaWAFBreakerCooldownSeconds
+			app.tripMediaCircuit(err, "waf", cooldown)
 		}
+		// WAF 可能只命中特定身份；短暂隔离后让下一次请求选择其他身份。
+		app.accounts.MarkRateLimitedFor(acc, normalizedUsage, cooldown, msg)
 		if app.logger != nil {
-			app.logger.Warn("上游 WAF 风控拦截，账号进入分用途冷却", "account", acc.Email, "usage", normalizedUsage, "error", truncate(msg, 240))
+			app.logger.Warn("上游 WAF 风控拦截，账号进入分用途冷却", "account", acc.Email, "usage", normalizedUsage, "cooldown_seconds", cooldown, "error", truncate(msg, 240))
 		}
 		return
 	}
@@ -5212,6 +5459,9 @@ func completionErrorStatus(err error) int {
 	}
 	if errors.Is(err, context.Canceled) {
 		return 499
+	}
+	if errors.Is(err, errAccountQueueFull) || errors.Is(err, errNoAvailableAccount) {
+		return http.StatusServiceUnavailable
 	}
 	if qwenUpstreamErrorCode(err) == "invalid_input" {
 		return http.StatusUnprocessableEntity
@@ -6658,7 +6908,7 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 				app.logWarn(ctx, "图片生成创建会话失败", "attempt", attempt+1, "error", err)
 				return
 			}
-			defer asyncDeleteChat(app.client, acc.Token, chatID)
+			defer asyncDeleteChat(app.client, qwenIdentityFromAccount(acc), chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
 			payload := buildChatPayload(chatID, model, promptText, false, nil, "image_gen", imageOptions, nil, false)
@@ -7215,7 +7465,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 				app.logWarn(ctx, "视频生成创建会话失败", "attempt", attempt+1, "error", err)
 				return
 			}
-			defer asyncDeleteChat(app.client, acc.Token, chatID)
+			defer asyncDeleteChat(app.client, qwenIdentityFromAccount(acc), chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
 			files := []map[string]any{}
@@ -7404,26 +7654,37 @@ func (app *App) refreshAccountBrowserCookies(ctx context.Context, acc Account) (
 	if strings.TrimSpace(acc.Token) == "" {
 		return acc, false, errors.New("empty token")
 	}
-	err := app.withBrowser(ctx, func(page pw.Page) error {
-		cookies, err := refreshQwenBrowserSession(ctx, page, acc.Token)
-		if err != nil {
-			return err
-		}
-		acc.Cookies = cookies
-		return nil
+	if err := browserAutomationGate.lock(ctx, false); err != nil {
+		return acc, false, err
+	}
+	defer browserAutomationGate.Unlock()
+	err := app.withBrowser(ctx, acc, func(page pw.Page) error {
+		var refreshErr error
+		acc, refreshErr = app.refreshAccountCookiesWithPage(ctx, page, acc)
+		return refreshErr
 	})
 	if err != nil {
 		return acc, false, err
 	}
+	return acc, hasQwenVerificationCookie(acc.Cookies), nil
+}
+
+// refreshAccountCookiesWithPage 使用现有有效 token 在已启动的浏览器上下文中采集媒体验证态。
+func (app *App) refreshAccountCookiesWithPage(ctx context.Context, page pw.Page, acc Account) (Account, error) {
+	cookies, err := refreshQwenBrowserSession(ctx, page, acc.Token)
+	if err != nil {
+		return acc, err
+	}
+	acc.Cookies = cookies
 	verify := app.client.VerifyTokenDetailForAccount(ctx, &acc)
 	if !verify.Valid {
-		return acc, false, fmt.Errorf("token verify failed after cookie refresh: %s", firstNonEmpty(verify.Error, verify.StatusCode))
+		return acc, fmt.Errorf("token verify failed after cookie refresh: %s", firstNonEmpty(verify.Error, verify.StatusCode))
 	}
 	acc.Valid = true
 	acc.ActivationPending = false
 	acc.StatusCode = "valid"
 	acc.LastError = ""
-	return acc, strings.TrimSpace(acc.Cookies) != "", nil
+	return acc, nil
 }
 
 func errorString(err error) string {
@@ -7502,6 +7763,9 @@ func upstreamMediaErrorStatus(err error) int {
 	}
 	if errors.Is(err, context.Canceled) {
 		return 499
+	}
+	if errors.Is(err, errAccountQueueFull) || errors.Is(err, errNoAvailableAccount) {
+		return http.StatusServiceUnavailable
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
@@ -7835,7 +8099,7 @@ func (app *App) adminStatus(w http.ResponseWriter, r *http.Request) {
 		"accounts":           app.accounts.Status(),
 		"per_account":        perAccount,
 		"chat_id_pool":       app.chatPool.Status(),
-		"runtime":            map[string]any{"mode": "go", "goroutines_note": "not exposed"},
+		"runtime":            map[string]any{"mode": "go", "goroutines": runtime.NumGoroutine(), "workers": app.settings.Workers, "workers_effective": false, "workers_note": "Go HTTP 并发不受 WORKERS 控制"},
 		"request_runtime":    map[string]any{"mode": "direct_http", "browser_required_for_requests": false, "description": "普通请求直连 HTTP，不经过浏览器"},
 		"browser_automation": map[string]any{"mode": "playwright", "description": "Go 后端通过 Playwright 浏览器自动化支持邮箱激活"},
 	})
@@ -7962,6 +8226,10 @@ func (app *App) adminActivateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Account not found")
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("force_browser_refresh")), "true") {
+		app.adminForceRefreshAccountBrowser(w, r, *target)
+		return
+	}
 	// 已有浏览器 Cookie 时才短路；Cookie 为空需要重新跑浏览器流程补齐 Baxia/AWSC 验证态。
 	if target.Valid && target.Token != "" && target.Cookies != "" && !target.ActivationPending {
 		verify := app.client.VerifyTokenDetailForAccount(r.Context(), target)
@@ -7992,6 +8260,27 @@ func (app *App) adminActivateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	app.logInfo(r.Context(), "账号激活成功", "account", email)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "账号激活成功"})
+}
+
+// adminForceRefreshAccountBrowser 使用现有有效 token 强制重建单个账号的浏览器验证态。
+func (app *App) adminForceRefreshAccountBrowser(w http.ResponseWriter, r *http.Request, target Account) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	app.logInfo(r.Context(), "账号浏览器验证态强制刷新开始", "account", target.Email)
+	updated, ok, err := app.refreshAccountBrowserCookies(ctx, target)
+	if err != nil || !ok {
+		msg := firstNonEmpty(errorString(err), "browser verification cookies not refreshed")
+		app.logWarn(r.Context(), "账号浏览器验证态强制刷新失败", "account", target.Email, "error", msg)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": msg})
+		return
+	}
+	if err := app.accounts.Add(updated); err != nil {
+		app.logWarn(r.Context(), "账号浏览器验证态强制刷新保存失败", "account", target.Email, "error", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	app.logInfo(r.Context(), "账号浏览器验证态强制刷新成功", "account", target.Email)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "账号浏览器验证态已刷新"})
 }
 
 func (app *App) adminVerifyAccount(w http.ResponseWriter, r *http.Request) {
@@ -8038,6 +8327,11 @@ func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 	if app.tokenRefresh != nil {
 		tokenRefreshStatus = app.tokenRefresh.Status()
 	}
+	proxyStatus := map[string]any{"enabled": false, "exits": 0, "sticky_by_account": true}
+	if app.upstreamProxy != nil && app.upstreamProxy.enabled() {
+		proxyStatus["enabled"] = true
+		proxyStatus["exits"] = len(app.upstreamProxy.uuids)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":                      Version,
 		"max_inflight_per_account":     app.settings.MaxInflightPerAccount,
@@ -8056,6 +8350,7 @@ func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 		"keepalive_status":             keepaliveStatus,
 		"token_refresh_running":        boolValue(tokenRefreshStatus["running"]),
 		"token_refresh_status":         tokenRefreshStatus,
+		"upstream_proxy_status":        proxyStatus,
 		"model_aliases":                modelMap,
 	})
 }
@@ -9353,13 +9648,19 @@ func latestHumanLineLen(prompt string) int {
 const qwenBaseURL = "https://chat.qwen.ai"
 
 type QwenClient struct {
-	pool     *AccountPool
-	settings Settings
-	logger   *slog.Logger
-	http     *http.Client
-	mu       sync.Mutex
-	deleted  map[string]bool
+	pool          *AccountPool
+	settings      Settings
+	logger        *slog.Logger
+	http          *http.Client
+	upstreamProxy *UpstreamProxyPool
+	mu            sync.Mutex
+	deleted       map[string]time.Time
 }
+
+const (
+	deletedChatLimit = 4096
+	deletedChatTTL   = time.Hour
+)
 
 type UpstreamEvent struct {
 	Type          string         `json:"type"`
@@ -9428,20 +9729,43 @@ func qwenIdentityFromAccount(acc *Account) QwenRequestIdentity {
 	}
 }
 
-func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *QwenClient {
+func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger, proxyPools ...*UpstreamProxyPool) *QwenClient {
+	var upstreamProxy *UpstreamProxyPool
+	if len(proxyPools) > 0 {
+		upstreamProxy = proxyPools[0]
+	}
 	return &QwenClient{
 		pool: pool, settings: settings, logger: logger,
-		http: &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment, MaxIdleConns: 100, MaxIdleConnsPerHost: 20,
-				IdleConnTimeout:       30 * time.Second,
-				ResponseHeaderTimeout: streamTimeoutDuration(settings.UpstreamStreamHeaderTimeoutSeconds),
-				ForceAttemptHTTP2:     true,
-			},
-			Timeout: 5 * time.Minute,
-		},
-		deleted: map[string]bool{},
+		http:          newQwenHTTPClient(settings, http.ProxyFromEnvironment),
+		upstreamProxy: upstreamProxy,
+		deleted:       map[string]time.Time{},
 	}
+}
+
+// httpClientForIdentity 返回身份固定出口客户端；未启用出口池时保留环境代理兼容性。
+func (c *QwenClient) httpClientForIdentity(identity QwenRequestIdentity) *http.Client {
+	if c.upstreamProxy != nil {
+		if client := c.upstreamProxy.httpClientForIdentity(identity, c.settings); client != nil {
+			return client
+		}
+	}
+	return c.http
+}
+
+// proxyExitLabel 返回适合日志记录的不可逆出口摘要。
+func (c *QwenClient) proxyExitLabel(identity QwenRequestIdentity) string {
+	if c.upstreamProxy == nil {
+		return "direct"
+	}
+	return c.upstreamProxy.exitLabel(identity)
+}
+
+// upstreamTransportError 清除代理 URL 中可能出现的用户名和凭据，仅保留错误类型与出口摘要。
+func (c *QwenClient) upstreamTransportError(identity QwenRequestIdentity, err error) error {
+	if err == nil || c.upstreamProxy == nil || !c.upstreamProxy.enabled() {
+		return err
+	}
+	return fmt.Errorf("upstream proxy transport failed (%s, %T)", c.proxyExitLabel(identity), err)
 }
 
 func qwenHeaders(token string) http.Header {
@@ -9531,11 +9855,13 @@ func (c *QwenClient) requestJSONForIdentity(ctx context.Context, method, path st
 	}
 	upstreamRequestID := req.Header.Get("x-request-id")
 	start := time.Now()
-	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "upstream_request_id", upstreamRequestID)
-	resp, err := c.http.Do(req)
+	proxyExit := c.proxyExitLabel(identity)
+	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "proxy_exit", proxyExit, "upstream_request_id", upstreamRequestID)
+	resp, err := c.httpClientForIdentity(identity).Do(req)
 	if err != nil {
-		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
-		return 0, err.Error(), err
+		safeErr := c.upstreamTransportError(identity, err)
+		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", safeErr)
+		return 0, safeErr.Error(), safeErr
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
@@ -9598,20 +9924,32 @@ func (c *QwenClient) CreateChatForIdentity(ctx context.Context, identity QwenReq
 }
 
 func (c *QwenClient) DeleteChat(ctx context.Context, token, chatID string) bool {
-	if token == "" || chatID == "" {
+	return c.DeleteChatForIdentity(ctx, qwenIdentityFromToken(token), chatID)
+}
+
+// DeleteChatForAccount 使用创建会话时的账号出口删除上游会话。
+func (c *QwenClient) DeleteChatForAccount(ctx context.Context, acc *Account, chatID string) bool {
+	return c.DeleteChatForIdentity(ctx, qwenIdentityFromAccount(acc), chatID)
+}
+
+// DeleteChatForIdentity 保证创建、流式调用和删除使用同一身份固定出口。
+func (c *QwenClient) DeleteChatForIdentity(ctx context.Context, identity QwenRequestIdentity, chatID string) bool {
+	if identity.Token == "" || chatID == "" {
 		return true
 	}
 	c.mu.Lock()
-	if c.deleted[chatID] {
+	now := time.Now()
+	c.cleanupDeletedChatsLocked(now)
+	if _, ok := c.deleted[chatID]; ok {
 		c.mu.Unlock()
 		return true
 	}
 	c.mu.Unlock()
 	for attempt := 1; attempt <= max(1, c.settings.ChatDeleteRetryAttempts); attempt++ {
-		status, text, err := c.requestJSON(ctx, http.MethodDelete, "/api/v2/chats/"+chatID, token, nil, 20*time.Second)
+		status, text, err := c.requestJSONForIdentity(ctx, http.MethodDelete, "/api/v2/chats/"+chatID, identity, nil, 20*time.Second)
 		if err == nil && (status == 200 || status == 204 || status == 404) {
 			c.mu.Lock()
-			c.deleted[chatID] = true
+			c.rememberDeletedChatLocked(chatID, time.Now())
 			c.mu.Unlock()
 			logInfo(c.logger, ctx, "删除上游会话完成", "chat_id", chatID, "attempt", attempt, "status", status)
 			return true
@@ -9620,6 +9958,35 @@ func (c *QwenClient) DeleteChat(ctx context.Context, token, chatID string) bool 
 		time.Sleep(time.Duration(c.settings.ChatDeleteRetryDelaySeconds*float64(attempt)*1000) * time.Millisecond)
 	}
 	return false
+}
+
+// cleanupDeletedChatsLocked 清理超过一小时的已删除会话标识。
+func (c *QwenClient) cleanupDeletedChatsLocked(now time.Time) {
+	if c.settings.PerformanceReleaseStage != "B" {
+		return
+	}
+	for id, deletedAt := range c.deleted {
+		if now.Sub(deletedAt) > deletedChatTTL {
+			delete(c.deleted, id)
+		}
+	}
+}
+
+// rememberDeletedChatLocked 记录删除结果并按最早时间淘汰超量项。
+func (c *QwenClient) rememberDeletedChatLocked(chatID string, now time.Time) {
+	c.cleanupDeletedChatsLocked(now)
+	if c.settings.PerformanceReleaseStage == "B" && len(c.deleted) >= deletedChatLimit {
+		oldestID := ""
+		oldestAt := now
+		for id, deletedAt := range c.deleted {
+			if oldestID == "" || deletedAt.Before(oldestAt) {
+				oldestID = id
+				oldestAt = deletedAt
+			}
+		}
+		delete(c.deleted, oldestID)
+	}
+	c.deleted[chatID] = now
 }
 
 func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, payload map[string]any, onEvent func(UpstreamEvent) error) error {
@@ -9648,12 +10015,14 @@ func (c *QwenClient) StreamChatForIdentity(ctx context.Context, identity QwenReq
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("X-Accel-Buffering", "no")
 	upstreamRequestID := req.Header.Get("x-request-id")
-	logInfo(c.logger, ctx, "开始上游流式请求", "chat_id", chatID, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "upstream_request_id", upstreamRequestID, "payload_bytes", len(raw))
+	proxyExit := c.proxyExitLabel(identity)
+	logInfo(c.logger, ctx, "开始上游流式请求", "chat_id", chatID, "token", redactToken(identity.Token), "account", firstNonEmpty(identity.Email, "-"), "cookies", identity.Cookies != "", "proxy_exit", proxyExit, "upstream_request_id", upstreamRequestID, "payload_bytes", len(raw))
 	start := time.Now()
-	resp, err := c.http.Do(req)
+	resp, err := c.httpClientForIdentity(identity).Do(req)
 	if err != nil {
-		logWarn(c.logger, ctx, "上游流式请求失败", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
-		return err
+		safeErr := c.upstreamTransportError(identity, err)
+		logWarn(c.logger, ctx, "上游流式请求失败", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", safeErr)
+		return safeErr
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -10099,6 +10468,7 @@ func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
 
 func (app *App) withRequestLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probe := r.URL.Path == "/healthz" || r.URL.Path == "/readyz"
 		reqID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 		if reqID == "" {
 			reqID = randomID()[:8]
@@ -10117,16 +10487,20 @@ func (app *App) withRequestLogging(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", reqID)
 		recorder := &loggingResponseWriter{ResponseWriter: w}
 
-		app.logInfo(ctx, "请求进入",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"query", truncate(r.URL.RawQuery, 240),
-			"remote", r.RemoteAddr,
-			"user_agent", truncate(r.UserAgent(), 160),
-		)
+		if !probe {
+			app.logInfo(ctx, "请求进入",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"query", truncate(r.URL.RawQuery, 240),
+				"remote", r.RemoteAddr,
+				"user_agent", truncate(r.UserAgent(), 160),
+			)
+		}
 
 		defer func() {
+			panicked := false
 			if recovered := recover(); recovered != nil {
+				panicked = true
 				app.logError(ctx, "请求处理异常",
 					"panic", recovered,
 					"stack", string(debug.Stack()),
@@ -10137,12 +10511,16 @@ func (app *App) withRequestLogging(next http.Handler) http.Handler {
 			if status == 0 {
 				status = http.StatusOK
 			}
+			duration := time.Since(logCtx.Start)
+			if probe && !panicked && status >= 200 && status < 300 && duration <= time.Second {
+				return
+			}
 			attrs := []any{
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", status,
 				"bytes", recorder.bytes,
-				"duration_ms", time.Since(logCtx.Start).Milliseconds(),
+				"duration_ms", duration.Milliseconds(),
 			}
 			if status >= 500 {
 				app.logError(ctx, "请求完成", attrs...)
@@ -10586,6 +10964,9 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeError(w http.ResponseWriter, status int, detail any) {
+	if status == http.StatusServiceUnavailable && w.Header().Get("Retry-After") == "" {
+		w.Header().Set("Retry-After", "1")
+	}
 	writeJSON(w, status, map[string]any{"detail": sanitizeClientErrorDetail(detail)})
 }
 

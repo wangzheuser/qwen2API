@@ -1,0 +1,10 @@
+services:
+  qwen2api:
+    # 发布 A 观测满 24 小时后由实测 p95/p99 和浏览器峰值填写。
+    mem_limit: "${MEMORY_LIMIT:?MEMORY_LIMIT is required for release B}"
+    mem_reservation: "${MEMORY_RESERVATION:?MEMORY_RESERVATION is required for release B}"
+    pids_limit: "${PIDS_LIMIT:?PIDS_LIMIT is required for release B}"
+    cpu_shares: "${CPU_SHARES:-1024}"
+    environment:
+      PERFORMANCE_RELEASE_STAGE: "B"
+      BROWSER_DISABLE_DEV_SHM_USAGE: "false"

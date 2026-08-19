@@ -10,6 +10,7 @@ import (
 const (
 	responseStateLimit    = 256
 	responseStateMaxBytes = 2 << 20
+	responseStateMaxTotal = 64 << 20
 	responseStateTTL      = time.Hour
 )
 
@@ -17,6 +18,7 @@ type storedResponseState struct {
 	AuthToken string
 	Items     []any
 	CreatedAt time.Time
+	SizeBytes int
 }
 
 // expandResponsesBody restores the item history referenced by previous_response_id.
@@ -27,8 +29,13 @@ func (app *App) expandResponsesBody(body map[string]any, authToken string) (map[
 	if previousID != "" {
 		app.responsesMu.Lock()
 		previous, ok := app.responses[previousID]
+		if ok && time.Since(previous.CreatedAt) > responseStateTTL {
+			delete(app.responses, previousID)
+			app.responsesBytes -= previous.SizeBytes
+			ok = false
+		}
 		app.responsesMu.Unlock()
-		if ok && previous.AuthToken == authToken && time.Since(previous.CreatedAt) <= responseStateTTL {
+		if ok && previous.AuthToken == authToken {
 			items = append(items, previous.Items...)
 		}
 	}
@@ -59,9 +66,14 @@ func (app *App) rememberResponse(id, authToken string, inputItems []any, output 
 	for key, state := range app.responses {
 		if now.Sub(state.CreatedAt) > responseStateTTL {
 			delete(app.responses, key)
+			app.responsesBytes -= state.SizeBytes
 		}
 	}
-	if len(app.responses) >= responseStateLimit {
+	if previous, ok := app.responses[id]; ok {
+		app.responsesBytes -= previous.SizeBytes
+		delete(app.responses, id)
+	}
+	for len(app.responses) >= responseStateLimit || (app.settings.PerformanceReleaseStage == "B" && app.responsesBytes+len(raw) > responseStateMaxTotal) {
 		oldestID := ""
 		oldestAt := now
 		for key, state := range app.responses {
@@ -70,9 +82,14 @@ func (app *App) rememberResponse(id, authToken string, inputItems []any, output 
 				oldestAt = state.CreatedAt
 			}
 		}
+		if oldestID == "" {
+			break
+		}
+		app.responsesBytes -= app.responses[oldestID].SizeBytes
 		delete(app.responses, oldestID)
 	}
-	app.responses[id] = storedResponseState{AuthToken: authToken, Items: items, CreatedAt: now}
+	app.responses[id] = storedResponseState{AuthToken: authToken, Items: items, CreatedAt: now, SizeBytes: len(raw)}
+	app.responsesBytes += len(raw)
 }
 
 // compactResponseStateItems discards the oldest complete turns before persisting Responses state.
