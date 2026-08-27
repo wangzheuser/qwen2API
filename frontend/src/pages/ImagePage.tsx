@@ -49,6 +49,17 @@ interface ImageGenerationResponse {
   error?: unknown
 }
 
+/** 使用无 Referer 链接访问上游 CDN，避免防盗链拒绝业务域名。 */
+function openImageLink(url: string, downloadName?: string) {
+  const a = document.createElement("a")
+  a.href = url
+  if (downloadName) a.download = downloadName
+  a.target = "_blank"
+  a.rel = "noopener noreferrer"
+  a.referrerPolicy = "no-referrer"
+  a.click()
+}
+
 export default function ImagePage() {
   const [prompt, setPrompt] = useState("")
   const [ratio, setRatio] = useState("1:1")
@@ -135,12 +146,11 @@ export default function ImagePage() {
   }
 
   const handleDownload = (url: string, idx: number) => {
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `qwen_image_${Date.now()}_${idx}.png`
-    a.target = "_blank"
-    a.rel = "noopener noreferrer"
-    a.click()
+    openImageLink(url, `qwen_image_${Date.now()}_${idx}.png`)
+  }
+
+  const handleOpen = (url: string) => {
+    openImageLink(url)
   }
 
   const handleImageLoad = (url: string, image: HTMLImageElement) => {
@@ -313,6 +323,7 @@ export default function ImagePage() {
                     alt={img.revised_prompt}
                     className="w-full h-auto object-contain"
                     loading="lazy"
+                    referrerPolicy="no-referrer"
                     onLoad={e => handleImageLoad(img.url, e.currentTarget)}
                     onError={e => {
                       const target = e.currentTarget
@@ -336,7 +347,7 @@ export default function ImagePage() {
                     <Button
                       size="sm"
                       variant="secondary"
-                      onClick={() => window.open(img.url, "_blank")}
+                      onClick={() => handleOpen(img.url)}
                     >
                       在新窗口打开
                     </Button>

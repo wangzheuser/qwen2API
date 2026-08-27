@@ -466,6 +466,12 @@ if [[ "${release_stage}" == "B" ]]; then
   compose_files+=( -f docker-compose.release-b.yml )
 fi
 
+# 候选槽会覆盖两次部署前遗留的旧版本；先移除同名容器，避免历史 Compose 项目名差异造成冲突。
+candidate_container="qwen2api-${candidate_slot}"
+if docker container inspect "${candidate_container}" >/dev/null 2>&1; then
+  docker rm -f "${candidate_container}" >/dev/null
+fi
+
 DEPLOY_SLOT="${candidate_slot}" DEPLOY_PORT="${candidate_port}" QWEN2API_TAG="${new_tag}" \
   docker compose -p "qwen2api_${candidate_slot}" --env-file .env.compose "${compose_files[@]}" up -d
 candidate_ready=false
@@ -479,7 +485,6 @@ if [[ "${candidate_ready}" != "true" ]]; then
   exit 1
 fi
 
-candidate_container="qwen2api-${candidate_slot}"
 baseline_memory="$(memory_current "${candidate_container}")"
 io_before="$(io_bytes "${candidate_container}")"
 shm_peak_file="${deploy_dir}/.shm-peak-${candidate_slot}.tmp"

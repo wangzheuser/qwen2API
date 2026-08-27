@@ -43,6 +43,7 @@ function MessageContent({ content }: { content: string }) {
           alt="generated"
           className="max-w-full rounded-lg shadow-md border"
           loading="lazy"
+          referrerPolicy="no-referrer"
           onError={e => { (e.currentTarget as HTMLImageElement).style.display = "none" }}
         />
         <div className="text-xs text-muted-foreground mt-1 break-all font-mono">{seg.url}</div>
