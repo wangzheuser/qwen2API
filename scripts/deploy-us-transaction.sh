@@ -11,6 +11,9 @@ SSH_PORT="${US_SSH_PORT:-}"
 REMOTE_DIR="${US_DEPLOY_DIR:-/opt/docker_projects/qwen2api}"
 PUBLIC_HEALTH_URL="${US_PUBLIC_HEALTH_URL:-https://qwen2api.codeai.de5.net/healthz}"
 POST_SWITCH_OBSERVE_SECONDS="${POST_SWITCH_OBSERVE_SECONDS:-3600}"
+POST_SWITCH_STABILIZE_TIMEOUT_SECONDS="${POST_SWITCH_STABILIZE_TIMEOUT_SECONDS:-60}"
+OBSERVATION_MAX_AVERAGE_MS="${OBSERVATION_MAX_AVERAGE_MS:-3976}"
+MEMORY_RECOVERY_TIMEOUT_SECONDS="${MEMORY_RECOVERY_TIMEOUT_SECONDS:-300}"
 POST_SMOKE_COOLDOWN_SECONDS="${POST_SMOKE_COOLDOWN_SECONDS:-0}"
 SMOKE_CHAT_SYNTHETIC_COUNT="${SMOKE_CHAT_SYNTHETIC_COUNT:-20}"
 CANDIDATE_READY_TIMEOUT_SECONDS="${CANDIDATE_READY_TIMEOUT_SECONDS:-720}"
@@ -40,6 +43,18 @@ esac
 }
 [[ "${POST_SMOKE_COOLDOWN_SECONDS}" =~ ^[0-9]+$ ]] || {
   printf 'Invalid post-smoke cooldown: %s\n' "${POST_SMOKE_COOLDOWN_SECONDS}" >&2
+  exit 2
+}
+[[ "${POST_SWITCH_STABILIZE_TIMEOUT_SECONDS}" =~ ^[0-9]+$ && "${POST_SWITCH_STABILIZE_TIMEOUT_SECONDS}" -ge 1 ]] || {
+  printf 'Invalid post-switch stabilization timeout: %s\n' "${POST_SWITCH_STABILIZE_TIMEOUT_SECONDS}" >&2
+  exit 2
+}
+[[ "${OBSERVATION_MAX_AVERAGE_MS}" =~ ^[0-9]+$ && "${OBSERVATION_MAX_AVERAGE_MS}" -ge 1 ]] || {
+  printf 'Invalid observation average latency: %s\n' "${OBSERVATION_MAX_AVERAGE_MS}" >&2
+  exit 2
+}
+[[ "${MEMORY_RECOVERY_TIMEOUT_SECONDS}" =~ ^[0-9]+$ && "${MEMORY_RECOVERY_TIMEOUT_SECONDS}" -ge 1 ]] || {
+  printf 'Invalid memory recovery timeout: %s\n' "${MEMORY_RECOVERY_TIMEOUT_SECONDS}" >&2
   exit 2
 }
 if [[ -n "${SSH_PORT}" ]]; then
@@ -132,7 +147,8 @@ fi
   "17863" "17864" "${RELEASE_STAGE}" "${POST_SWITCH_OBSERVE_SECONDS}" \
   "${SMOKE_CHAT_SYNTHETIC_COUNT}" "${remote_smoke_script}" "${remote_stage_dir}" \
   "${CANDIDATE_READY_TIMEOUT_SECONDS}" "${REUSE_REMOTE_IMAGE}" "${LOCAL_BINARY_SHA}" \
-  "${POST_SMOKE_COOLDOWN_SECONDS}" <<'REMOTE'
+  "${POST_SMOKE_COOLDOWN_SECONDS}" "${POST_SWITCH_STABILIZE_TIMEOUT_SECONDS}" \
+  "${OBSERVATION_MAX_AVERAGE_MS}" "${MEMORY_RECOVERY_TIMEOUT_SECONDS}" <<'REMOTE'
 set -Eeuo pipefail
 action="$1"
 new_tag="$2"
@@ -150,6 +166,9 @@ candidate_ready_timeout_seconds="${13}"
 reuse_remote_image="${14}"
 expected_binary_sha="${15}"
 post_smoke_cooldown_seconds="${16}"
+post_switch_stabilize_timeout_seconds="${17}"
+observation_max_average_ms="${18}"
+memory_recovery_timeout_seconds="${19}"
 state_file="${deploy_dir}/.active-slot"
 previous_file="${deploy_dir}/.previous-slot"
 router_config="${deploy_dir}/qwen2api-router.conf"
@@ -229,9 +248,8 @@ port = sys.argv[3]
 if not port.isdigit():
     raise SystemExit("invalid router target port")
 target = Path(sys.argv[2])
-tmp = target.with_suffix(target.suffix + ".tmp")
-tmp.write_text(template.replace("__QWEN2API_TARGET_PORT__", port), encoding="utf-8")
-tmp.replace(target)
+# 单文件 bind mount 绑定 inode；原地写入才能让运行中的路由容器看到新内容。
+target.write_text(template.replace("__QWEN2API_TARGET_PORT__", port), encoding="utf-8")
 PY
 }
 
@@ -249,9 +267,33 @@ verify_stable_routes() {
   curl -fsS "${public_health_url}" >/dev/null
 }
 
+# wait_stable_routes 等待路由旧 worker 退出，避免旧槽停止后的瞬时 502 误判。
+wait_stable_routes() {
+  local attempts
+  attempts=$(( (post_switch_stabilize_timeout_seconds + 1) / 2 ))
+  for _ in $(seq 1 "${attempts}"); do
+    if verify_stable_routes; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 switch_router() {
+  local host_config_sha container_config_sha compose_recreate=false
   render_router_config "$1"
-  docker compose -p qwen2api_router -f "${router_compose}" up -d >/dev/null
+  host_config_sha="$(sha256sum "${router_config}" | awk '{print $1}')"
+  container_config_sha="$(docker exec qwen2api-router sha256sum /etc/nginx/conf.d/default.conf 2>/dev/null | awk '{print $1}' || true)"
+  # 兼容历史原子替换遗留的失联 bind mount；仅在 inode 已脱节时重建内部路由。
+  if [[ "${container_config_sha}" != "${host_config_sha}" ]]; then
+    compose_recreate=true
+  fi
+  if [[ "${compose_recreate}" == "true" ]]; then
+    docker compose -p qwen2api_router -f "${router_compose}" up -d --force-recreate >/dev/null
+  else
+    docker compose -p qwen2api_router -f "${router_compose}" up -d >/dev/null
+  fi
   docker exec qwen2api-router nginx -t >/dev/null
   docker exec qwen2api-router nginx -s reload
   for _ in $(seq 1 30); do
@@ -338,7 +380,7 @@ PY
   done
   (( checks > 0 )) || return 1
   (( failures * 100 < checks * 2 )) || return 1
-  (( total_duration / checks <= 3976 )) || return 1
+  (( total_duration / checks <= observation_max_average_ms )) || return 1
   probe_logs="$(docker logs --since "${observe_seconds}s" "${container}" 2>&1 | grep -Ec '请求(进入|完成).*path=/(healthz|readyz)' || true)"
   empty_cleanup_logs="$(docker logs --since "${observe_seconds}s" "${container}" 2>&1 | grep -Ec '上下文缓存清理完成.*removed_records=0.*removed_files=0' || true)"
   (( probe_logs <= 35 )) || return 1
@@ -515,6 +557,7 @@ switch_router "${candidate_port}"
 docker stop "qwen2api-${active_slot}" >/dev/null
 old_stopped=true
 [[ "$(docker inspect -f '{{.State.Running}}' "qwen2api-${active_slot}")" == "false" ]]
+wait_stable_routes
 
 if (( observe_seconds > 0 )); then
   if ! observe_release "${candidate_slot}"; then
@@ -526,21 +569,26 @@ if (( observe_seconds > 0 )); then
   fi
 fi
 sleep 600
-if ! recovered_memory="$(memory_current "${candidate_container}")"; then
-  printf 'deployment result=failed reason=memory_recovery_probe\n' >&2
-  rollback_routes
-  cleanup_archive
-  trap - ERR
-  exit 1
-fi
 recovery_limit=$((baseline_memory * 120 / 100))
-if [[ ! "${recovered_memory}" =~ ^[0-9]+$ || "${recovered_memory}" -gt "${recovery_limit}" ]]; then
+memory_recovery_deadline=$(( $(date +%s) + memory_recovery_timeout_seconds ))
+memory_recovered=false
+while true; do
+  recovered_memory="$(memory_current "${candidate_container}" 2>/dev/null || true)"
+  if [[ "${recovered_memory}" =~ ^[0-9]+$ && "${recovered_memory}" -le "${recovery_limit}" ]]; then
+    memory_recovered=true
+    break
+  fi
+  (( $(date +%s) >= memory_recovery_deadline )) && break
+  sleep 10
+done
+if [[ "${memory_recovered}" != "true" ]]; then
   printf 'deployment result=failed reason=memory_recovery_gate\n' >&2
   rollback_routes
   cleanup_archive
   trap - ERR
   exit 1
 fi
+printf 'memory recovery=passed current_bytes=%s limit_bytes=%s\n' "${recovered_memory}" "${recovery_limit}"
 
 atomic_write "${previous_file}" "${active_slot}"
 atomic_write "${state_file}" "${candidate_slot}"

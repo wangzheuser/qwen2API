@@ -1752,15 +1752,20 @@ func (app *App) withBrowser(ctx context.Context, acc Account, fn func(page pw.Pa
 }
 
 func loginAndGetToken(ctx context.Context, page pw.Page, email, password string, timeout time.Duration) string {
-	_, _ = page.Goto(qwenBaseURL+"/auth", pw.PageGotoOptions{WaitUntil: pw.WaitUntilStateDomcontentloaded, Timeout: pw.Float(30000)})
-	sleepWithContext(ctx, 2*time.Second)
-	if !fillFirst(page, []string{`input[placeholder*="Email"]`, `input[type="email"]`}, email, 10000) {
+	// 登录页改为由首页按钮初始化，直接访问 /auth 只会展示 App 下载提示。
+	if _, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{WaitUntil: pw.WaitUntilStateDomcontentloaded, Timeout: pw.Float(30000)}); err != nil {
+		return ""
+	}
+	if !clickFirst(page, []string{`button:has-text("Log in")`, `button:has-text("登录")`}, 10000) {
+		return ""
+	}
+	if !fillFirst(page, []string{`input[placeholder*="Email"]`, `input[placeholder*="电子邮箱"]`, `input[type="email"]`}, email, 10000) {
 		_ = fillNthInput(page, 0, email)
 	}
-	if !fillFirst(page, []string{`input[type="password"]`, `input[placeholder*="Password"]`}, password, 10000) {
+	if !fillFirst(page, []string{`input[type="password"]`, `input[placeholder*="Password"]`, `input[placeholder*="密码"]`}, password, 10000) {
 		_ = fillPasswordInput(page, 0, password)
 	}
-	if !clickFirst(page, []string{`button:has-text("Log in")`, `button[type="submit"]:not([disabled])`, `button[type="submit"]`, `button:has-text("Continue")`}, 5000) {
+	if !clickFirst(page, []string{`button:has-text("Log in")`, `button:has-text("登录")`, `button[type="submit"]:not([disabled])`, `button[type="submit"]`, `button:has-text("Continue")`}, 5000) {
 		_ = page.Press(`input[type="password"]`, "Enter")
 	}
 	deadline := time.Now().Add(timeout)
