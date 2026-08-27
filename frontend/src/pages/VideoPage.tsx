@@ -4,6 +4,7 @@ import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import { openMediaLink } from "../lib/media"
 import {
   FALLBACK_VIDEO_MODELS,
   chooseDefaultModel,
@@ -670,13 +671,9 @@ export default function VideoPage() {
     }
   }
 
+  /** 下载生成视频，并保持上游媒体请求不携带业务域名。 */
   const handleDownload = (url: string, idx: number) => {
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `qwen_video_${Date.now()}_${idx}.mp4`
-    a.target = "_blank"
-    a.rel = "noopener noreferrer"
-    a.click()
+    openMediaLink(url, `qwen_video_${Date.now()}_${idx}.mp4`)
   }
 
   return (
@@ -948,7 +945,7 @@ export default function VideoPage() {
                     <Button size="sm" variant="secondary" onClick={() => handleDownload(video.url, idx)} className="gap-1.5">
                       <Download className="h-3.5 w-3.5" /> 下载
                     </Button>
-                    <Button size="sm" variant="secondary" onClick={() => window.open(video.url, "_blank")}>
+                    <Button size="sm" variant="secondary" onClick={() => openMediaLink(video.url)}>
                       打开
                     </Button>
                   </div>
@@ -1078,7 +1075,7 @@ export default function VideoPage() {
                           type="button"
                           size="sm"
                           variant="ghost"
-                          onClick={() => window.open(url, "_blank")}
+                          onClick={() => openMediaLink(url)}
                           className="h-7 gap-1.5 px-2 text-xs"
                         >
                           <ExternalLink className="h-3.5 w-3.5" /> 打开

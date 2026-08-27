@@ -4,6 +4,7 @@ import { Button } from "../components/ui/button"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
+import { openMediaLink } from "../lib/media"
 import {
   FALLBACK_IMAGE_MODELS,
   chooseDefaultModel,
@@ -47,17 +48,6 @@ interface ImageGenerationResponse {
   data?: ImageGenerationItem[]
   detail?: unknown
   error?: unknown
-}
-
-/** 使用无 Referer 链接访问上游 CDN，避免防盗链拒绝业务域名。 */
-function openImageLink(url: string, downloadName?: string) {
-  const a = document.createElement("a")
-  a.href = url
-  if (downloadName) a.download = downloadName
-  a.target = "_blank"
-  a.rel = "noopener noreferrer"
-  a.referrerPolicy = "no-referrer"
-  a.click()
 }
 
 export default function ImagePage() {
@@ -145,12 +135,14 @@ export default function ImagePage() {
     }
   }
 
+  /** 下载生成图片，并保持上游媒体请求不携带业务域名。 */
   const handleDownload = (url: string, idx: number) => {
-    openImageLink(url, `qwen_image_${Date.now()}_${idx}.png`)
+    openMediaLink(url, `qwen_image_${Date.now()}_${idx}.png`)
   }
 
+  /** 在新标签页打开生成图片。 */
   const handleOpen = (url: string) => {
-    openImageLink(url)
+    openMediaLink(url)
   }
 
   const handleImageLoad = (url: string, image: HTMLImageElement) => {
